@@ -460,12 +460,12 @@ describe('Initial Session State', () => {
     })
 
     /**
-     * `skillsLoader` is the per-run fix; this is the backstop for a host that
-     * never sets it. Freebuff Cloud reaches the runner through
-     * initialSessionState, so the guard has to hold at THIS entry point and not
-     * only inside loadSkills.
+     * Home skills are ON by default (upstream 0.10.7 behavior, restored —
+     * see `includeHomeSkills` docs in run-state.ts). A server-side embedder
+     * whose repo lives on another machine MUST inject `skillsLoader`, which
+     * wins outright — that is the guard this suite's other tests cover.
      */
-    test('a run that sets nothing still cannot read the home directory', async () => {
+    test('a run that sets nothing reads home skills by default, and can opt out', async () => {
       const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'sdk-home-guard-'))
       const fakeHome = path.join(tempRoot, 'home')
       const skillDir = path.join(fakeHome, '.claude', 'skills', 'server-skill')
@@ -484,21 +484,20 @@ describe('Initial Session State', () => {
           logger: mockLogger,
         })
 
-        expect(Object.keys(sessionState.fileContext.skills!)).toHaveLength(0)
+        expect(Object.keys(sessionState.fileContext.skills!)).toEqual([
+          'server-skill',
+        ])
 
-        // Same call, opted in: proves the seed was discoverable and this test
-        // is not passing because the fixture was wrong.
-        const optedIn = await initialSessionState({
+        // Same call, opted out: proves the flag still works.
+        const optedOut = await initialSessionState({
           cwd: '/home/daytona/codebase',
-          includeHomeSkills: true,
+          includeHomeSkills: false,
           projectFiles: { 'src/index.ts': 'console.log("hello");' },
           fs: mockFs,
           logger: mockLogger,
         })
 
-        expect(Object.keys(optedIn.fileContext.skills!)).toEqual([
-          'server-skill',
-        ])
+        expect(Object.keys(optedOut.fileContext.skills!)).toHaveLength(0)
       } finally {
         homedirSpy.mockRestore()
         rmSync(tempRoot, { recursive: true, force: true })

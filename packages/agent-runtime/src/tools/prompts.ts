@@ -8,7 +8,6 @@ import { getToolCallString } from '@codebuff/common/tools/utils'
 import { buildArray } from '@codebuff/common/util/array'
 import { formatAvailableSkillsXml } from '@codebuff/common/util/skills'
 import { pluralize } from '@codebuff/common/util/string'
-import { cloneDeep } from 'lodash'
 import z from 'zod/v4'
 import { convertJsonSchemaToZod } from 'zod-from-json-schema'
 
@@ -38,11 +37,37 @@ export function ensureZodSchema(
   return convertJsonSchemaToZod(schema as Record<string, unknown>)
 }
 
+/**
+ * True when `schema` is a live zod v4 schema object. A lodash cloneDeep of a
+ * zod v4 schema keeps `safeParse` (so a duck-type check alone passes) but
+ * loses the internal `_zod` object graph, which makes `z.toJSONSchema` throw
+ * and every validation silently fall back — that corruption is exactly what
+ * this check exists to catch. See getToolSet below for the fix that uses it.
+ */
+export function isLiveZodV4Schema(schema: unknown): boolean {
+  return (
+    typeof schema === 'object' &&
+    schema !== null &&
+    '_zod' in schema &&
+    (schema as { _zod?: unknown })._zod !== undefined
+  )
+}
+
 function ensureJsonSchemaCompatible(schema: z.ZodType): z.ZodType {
   try {
     z.toJSONSchema(schema, { io: 'input' })
     return schema
-  } catch {
+  } catch (error) {
+    // A live zod v4 schema that cannot round-trip through JSON Schema still
+    // VALIDATES correctly — and the AI SDK's zod4 adapter calls z.toJSONSchema
+    // itself, so swapping the schema here would only hide the real object's
+    // stricter validation behind an accept-anything stub. Keep the original:
+    // worst case the AI SDK surfaces a clear conversion error instead of the
+    // tool receiving stripped/empty inputs. The stub path stays for corrupted
+    // (e.g. cloneDeep'd) schemas, which can neither convert nor validate.
+    if (isLiveZodV4Schema(schema)) {
+      return schema
+    }
     const fallback = z.object({}).passthrough()
     return schema.description ? fallback.describe(schema.description) : fallback
   }
@@ -430,7 +455,15 @@ export async function getToolSet(params: {
 
   const toolDefinitions = await additionalToolDefinitions()
   for (const [toolName, toolDefinition] of Object.entries(toolDefinitions)) {
-    const clonedDef = cloneDeep(toolDefinition)
+    // Shallow copy only. lodash cloneDeep corrupts zod v4 schemas: the clone
+    // keeps `safeParse` but loses the internal `_zod` graph, so downstream
+    // `z.toJSONSchema` throws and the schema used to be silently swapped for
+    // an accept-anything `z.object({}).passthrough()` — the model was then
+    // told the tool takes no params and every param'd MCP/custom tool call
+    // reached the handler with empty input. The def's other fields are plain
+    // JSON data (name/description/endsAgentStep/mcpOrigin), so a shallow
+    // spread is sufficient isolation.
+    const clonedDef = { ...toolDefinition }
     // Custom tool inputSchema may be JSON Schema (from SDK) or Zod (from MCP)
     // Ensure it's a Zod schema for the AI SDK
     const zodSchema = ensureZodSchema(clonedDef.inputSchema)

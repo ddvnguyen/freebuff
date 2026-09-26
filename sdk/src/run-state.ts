@@ -108,8 +108,10 @@ export type InitialSessionStateOptions = {
   skillsLoader?: () => Promise<SkillsMap>
   /**
    * Also load the user's `~/.claude/skills` and `~/.agents/skills`. Defaults to
-   * false, so an embedder gets project-only skills unless it states that this
-   * process belongs to that user. See `LoadSkillsOptions.includeHomeSkills`.
+   * true, matching upstream @codebuff/sdk 0.10.7 (getDefaultSkillsDirs always
+   * includes the home dirs). A server-side embedder whose repo lives on a
+   * different machine (Freebuff Cloud) must pass an injected `skillsLoader`
+   * — that remains the sanctioned escape hatch, and it wins outright below.
    */
   includeHomeSkills?: boolean
   projectFiles?: Record<string, string>
@@ -852,7 +854,7 @@ export async function initialSessionState(
     maxAgentSteps,
     skillsDir,
     skillsLoader,
-    includeHomeSkills = false,
+    includeHomeSkills = true,
   } = params
   let {
     agentDefinitions,

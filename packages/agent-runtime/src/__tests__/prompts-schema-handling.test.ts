@@ -221,8 +221,11 @@ describe('Schema handling error recovery', () => {
 
       expect(description).toContain('greet__greet')
       expect(description).toContain('Params: {')
-      expect(description).toContain('allOf')
+      // The endsAgentStep flag is merged as a proper property (a flat object
+      // schema) rather than the old allOf intersection wrapper — either way
+      // the MCP tool's own params must survive into the description.
       expect(description).toContain('name')
+      expect(description).toContain('cb_easp')
       expect(description).not.toContain('Params: None')
     })
 
