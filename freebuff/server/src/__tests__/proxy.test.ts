@@ -77,6 +77,12 @@ beforeAll(async () => {
           headers: { 'content-type': 'text/event-stream' },
         })
       }
+      if (url.pathname === '/api/auth/login/start') {
+        return Response.json({
+          url: `http://127.0.0.1:${upstreamPort()}/auth/login/launch/tok`,
+          attemptId: 'attempt-1',
+        })
+      }
       if (url.pathname === '/api/setcookie') {
         return new Response('ok', {
           headers: { 'set-cookie': 'flavor=vanilla; Path=/' },
@@ -225,6 +231,19 @@ describe('authenticated proxying', () => {
       body: 'nope',
     })
     expect(response.status).toBe(403)
+  })
+
+  it('rewrites the loopback sign-in launch URL in a JSON body', async () => {
+    const response = await fetch(`${base}/api/auth/login/start`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: '{}',
+    })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({
+      url: '/auth/login/launch/tok',
+      attemptId: 'attempt-1',
+    })
   })
 
   it('passes upstream cookies through', async () => {
