@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Freebuff Desktop</title>
+    <!-- This must not depend on the built JS or CSS: it is the UI for an install
+         whose entry assets are missing. React removes it when the app mounts. -->
+    <style>
+      :root {
+        --recovery-space-2: 8px;
+        --recovery-space-3: 12px;
+        --recovery-space-4: 16px;
+        --recovery-space-6: 24px;
+        --recovery-radius-control: 14px;
+        --recovery-radius-dialog: 24px;
+        --recovery-font-ui: 13px;
+        --recovery-font-body: 14px;
+        --recovery-font-title: 18px;
+        --recovery-weight-semibold: 600;
+        /* The normal shell's matte palette, kept inline so missing assets cannot blank recovery. */
+        --recovery-shell: #292b2a;
+        --recovery-surface: #222423;
+        --recovery-border: #2f322f;
+        --recovery-text: #dedfdd;
+        --recovery-muted: #a0a39f;
+        --recovery-action: #b5cea5;
+        --recovery-action-text: #1c211b;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --recovery-shell: #e3e7e4;
+          --recovery-surface: #f7f8f5;
+          --recovery-border: #d8ded8;
+          --recovery-text: #232b26;
+          --recovery-muted: #5d6962;
+          --recovery-action: #b5cea5;
+          --recovery-action-text: #232b26;
+        }
+      }
+      #startup-recovery {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        padding: var(--recovery-space-6);
+        visibility: hidden;
+        background: var(--shell-base, var(--recovery-shell));
+        color: var(--text, var(--recovery-text));
+        font: var(--recovery-font-body) / 1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        animation: reveal-startup-recovery 0s 15s forwards;
+      }
+      /* The bootstrap hooks below can tell a missing entry bundle from an app that is merely slow
+         to mount; the animation above cannot, and revealing on a fixed 15s timer is what accused
+         installs that then worked. While the hooks are running they own the reveal and do it by
+         attribute as soon as they can justify it, so 15s becomes the backstop for the hooks
+         themselves dying after they ran. A document whose inline script never ran keeps the 15s
+         reveal: it has nothing else to show the user. */
+      html[data-bootstrap-hooks] #startup-recovery {
+        animation-delay: 60s;
+      }
+      html[data-recovery='show'] #startup-recovery {
+        visibility: visible;
+      }
+      #startup-recovery section {
+        box-sizing: border-box;
+        width: min(440px, 100%);
+        padding: var(--recovery-space-6);
+        border: 1px solid var(--border, var(--recovery-border));
+        border-radius: var(--radius-dialog, var(--recovery-radius-dialog));
+        corner-shape: squircle;
+        background: var(--surface, var(--recovery-surface));
+      }
+      #startup-recovery h1 {
+        margin: 0 0 var(--recovery-space-2);
+        color: var(--text, var(--recovery-text));
+        font-size: var(--recovery-font-title);
+        font-weight: var(--recovery-weight-semibold);
+        line-height: 1.3;
+      }
+      #startup-recovery p {
+        margin: 0 0 var(--recovery-space-4);
+        color: var(--muted, var(--recovery-muted));
+      }
+      #startup-recovery .actions {
+        display: flex;
+        align-items: center;
+        gap: var(--recovery-space-3);
+        flex-wrap: wrap;
+      }
+      #startup-recovery .primary {
+        padding: var(--recovery-space-2) var(--recovery-space-3);
+        border-radius: var(--radius-control, var(--recovery-radius-control));
+        corner-shape: squircle;
+        background: var(--primary-action, var(--recovery-action));
+        color: var(--primary-action-text, var(--recovery-action-text));
+        font: var(--recovery-weight-semibold) var(--recovery-font-ui) -apple-system, BlinkMacSystemFont,
+          'Segoe UI', sans-serif;
+      }
+      #startup-recovery a {
+        color: var(--text, var(--recovery-text));
+        font-weight: var(--recovery-weight-semibold);
+        text-decoration: none;
+      }
+      #startup-recovery a:focus-visible {
+        outline: 2px solid var(--primary-action, var(--recovery-action));
+        outline-offset: 3px;
+      }
+      @keyframes reveal-startup-recovery {
+        to {
+          visibility: visible;
+        }
+      }
+    </style>
+    <!-- All of the app's error reporting lives inside the module below, so it cannot report the one
+         failure that matters most: the module never running. A mis-served or missing asset leaves a
+         blank window that reaches no error boundary and logs nothing anywhere. These hooks are
+         inline, classic rather than module, and in the head before Vite's generated asset tags. -->
+    <script>
+      ;(function () {
+        var sent = {}
+        var html = document.documentElement
+        // Tells the stylesheet that these hooks are alive, so its own 15s reveal stands down to a
+        // 60s backstop and the deadline below owns the verdict instead.
+        html.setAttribute('data-bootstrap-hooks', '')
+        // Whether anything has actually failed. A blank window with one of these is a broken
+        // install; a blank window with none of them is an app that has not finished starting, and
+        // the deadline below is the only place that can still tell them apart.
+        var sawFailure = false
+        function report(name, message, stack) {
+          if (!message || sent[name + message]) return
+          sent[name + message] = 1
+          try {
+            fetch('/api/diagnostics/renderer-error', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ name: name, message: message, stack: stack, boundary: 'bootstrap' }),
+              // survives the window being closed on a dead-looking app
+              keepalive: true,
+            })['catch'](function () {})
+          } catch (e) {}
+        }
+        // Capture phase: a failed script or stylesheet fires on the element and does not bubble.
+        // Images are content, not renderer failures, and would only add noise here.
+        window.addEventListener(
+          'error',
+          function (event) {
+            var el = event.target
+            if (el && el !== window && el.tagName) {
+              if (el.tagName === 'SCRIPT' || el.tagName === 'LINK') {
+                sawFailure = true
+                report(
+                  'ResourceError',
+                  'failed to load ' + el.tagName.toLowerCase() + ': ' + (el.src || el.href || ''),
+                )
+              }
+              return
+            }
+            // "ResizeObserver loop completed with undelivered notifications" is a benign browser
+            // condition, not a renderer failure: a callback moved something, so the browser skipped
+            // a notification and re-delivers it on the next frame. It arrives with no `event.error`,
+            // so the row carries no stack and names nothing to fix. At ~7.2k rows/day it was the
+            // largest error line in the whole dataset, burying the ones worth reading.
+            if (event.message && event.message.indexOf('ResizeObserver loop') !== -1) return
+            sawFailure = true
+            report((event.error && event.error.name) || 'Error', event.message, event.error && event.error.stack)
+          },
+          true,
+        )
+        window.addEventListener('unhandledrejection', function (event) {
+          var reason = event.reason
+          sawFailure = true
+          report(
+            (reason && reason.name) || 'UnhandledRejection',
+            (reason && reason.message) || String(reason),
+            reason && reason.stack,
+          )
+        })
+        function stillBlank() {
+          return !!document.getElementById('startup-recovery')
+        }
+        function reveal() {
+          html.setAttribute('data-recovery', 'show')
+        }
+        // Two different failures used to arrive under one name, and the screen accused both.
+        // Measured on 2026-10-15 over 24h of production rows: 157 `BlankWindow` reports from 123
+        // installs, 94% Windows x64. Of the 57 whose session fell inside the renderer-error
+        // sample, 21 emitted app-level window errors AFTER this deadline -- which only a mounted
+        // app can emit -- so the install was fine and merely slow; 10 had a first-party asset
+        // failure, corroborated server-side by `desktop.asset_missing` rows naming the entry
+        // `assets/index-*.js` and `index-*.css`; the rest carried no evidence either way.
+        setTimeout(function () {
+          if (!stillBlank()) return
+          if (sawFailure) {
+            reveal()
+            report('BlankWindow', 'nothing mounted 15s after the document loaded')
+            return
+          }
+          // Every asset arrived and nothing threw, so the app is still starting: a cold cache, a
+          // slow disk, a busy machine. Telling this user to reinstall is wrong, so report it
+          // under its own name -- countable, and never mistaken for a broken install -- and give
+          // the app the rest of the minute before showing anything.
+          report(
+            'SlowMount',
+            'nothing mounted 15s after the document loaded, but every entry asset arrived',
+          )
+          setTimeout(function () {
+            if (!stillBlank()) return
+            reveal()
+            report('BlankWindow', 'nothing mounted 60s after the document loaded')
+          }, 45000)
+        }, 15000)
+      })()
+    </script>
+    <script type="module" crossorigin src="/assets/index-C422Roxo.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DMHSA4jb.css">
+  </head>
+  <body>
+    <div id="root">
+      <main id="startup-recovery" role="alert">
+        <section>
+          <h1>Freebuff couldn’t load</h1>
+          <p>
+            Part of the interface did not start. Reload once; if this screen returns, reinstall the
+            latest version. Your projects and conversations are safe.
+          </p>
+          <div class="actions">
+            <!-- The app root, not `href=""`: this screen can be showing on a stray deep path
+                 (the SPA server answers any extensionless path with this document), and a reload
+                 of that path is a reload of the problem. -->
+            <a class="primary" href="/">Reload Freebuff</a>
+            <a href="https://freebuff.com/desktop" target="_blank" rel="noreferrer">
+              Get latest installer
+            </a>
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

@@ -29,8 +29,11 @@ FREEBUFF_WEB_HOST=127.0.0.1 bun run start:server
 ```
 
 Open <http://localhost:4310> and enter the password printed on first run. The
-[server README](server/README.md) covers the one-time browser sign-in, LAN and
-Tailscale access, HTTPS, configuration, and troubleshooting.
+server works on macOS, Linux, and Windows. Linux does not need Freebuff Desktop
+installed: it uses the runtime exported in `server/runtime` and the Linux
+ripgrep binaries already in `sdk/vendor`. The [server README](server/README.md)
+covers refreshing that runtime, the one-time browser sign-in, LAN and Tailscale
+access, HTTPS, configuration, and troubleshooting.
 
 ## Project Structure
 

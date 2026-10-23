@@ -1,10 +1,10 @@
 # Freebuff Web server
 
-Serve the Freebuff Desktop app you already have installed to browsers on your
-network. This is not a reimplementation: it starts the Desktop app's own Bun
-orchestrator (the process the Electron shell normally supervises) and puts a
-password-protected reverse proxy in front of it, including its UI, API, live
-event stream and terminal WebSocket.
+Serve the Freebuff Desktop UI to browsers, using either the installed Desktop
+app or the runtime exported in this package. This is not a reimplementation: it
+starts the app's own Bun orchestrator (the process the Electron shell normally
+supervises) and puts a password-protected reverse proxy in front of it,
+including its UI, API, live event stream and terminal WebSocket.
 
 ```
 browser ── password ──▶ proxy (0.0.0.0:4310) ──▶ orchestrator (127.0.0.1:<random>)
@@ -15,9 +15,11 @@ browser ── password ──▶ proxy (0.0.0.0:4310) ──▶ orchestrator (1
 
 ## Requirements
 
-- Freebuff Desktop installed. The server reuses the app's own orchestrator and
-  UI, so it does not ship a second copy of either. It looks in the standard
-  install locations:
+- Freebuff Desktop installed **or** the exported runtime in
+  `freebuff/server/runtime` (included in this repository; used automatically
+  when no Desktop install is found). The server reuses the app's own
+  orchestrator and UI rather than a second implementation. It looks in the
+  standard install locations:
   - macOS: `/Applications/Freebuff.app` or `~/Applications/Freebuff.app`
   - Windows: `%LOCALAPPDATA%\Programs\Freebuff\resources` or
     `%PROGRAMFILES%\Freebuff\resources`
@@ -25,9 +27,50 @@ browser ── password ──▶ proxy (0.0.0.0:4310) ──▶ orchestrator (1
     `/usr/lib/freebuff/resources`, or `~/.local/share/freebuff/resources`
   - Anything else: set `FREEBUFF_APP_PATH` to the app bundle, its `Resources`
     directory, or `orchestrator.js`.
-- Bun 1.3 or newer (`bun --version`). The app's bundled Bun runtime is used when
-  present.
+- Bun 1.4.2 or newer (`bun --version`), plus `git` on `PATH`.
 - A clone of this repository.
+
+## Standalone runtime (Linux and no Desktop install)
+
+`freebuff/server/runtime` is an exported copy of the Desktop 0.0.188 runtime:
+`orchestrator.js`, the UI, and the tree-sitter wasm grammars. When no Desktop
+app is found, the server uses this copy, so Linux does not need Freebuff
+Desktop installed at all. Ripgrep comes from `sdk/vendor/ripgrep`, which
+already ships x64 and arm64 binaries for Linux, macOS, and Windows, and the
+server passes the right one to the orchestrator.
+
+### Refresh the exported runtime
+
+Run this on a machine that has Freebuff Desktop installed, then commit the
+result if you want other machines to pick it up:
+
+```bash
+# From the repository root
+bun --cwd=freebuff/server run export-runtime
+
+# Or from this directory
+cd freebuff/server
+bun run export-runtime
+
+# A custom app location
+bun run export-runtime -- /path/to/Freebuff.app
+```
+
+It writes a `runtime/manifest.json` with the Desktop version and export time.
+Restart the server after refreshing the runtime. If both Desktop and the
+exported runtime are present, the installed app wins; set
+`FREEBUFF_RUNTIME_DIR` to force the exported copy.
+
+### Linux quick start
+
+```bash
+bun install
+FREEBUFF_WEB_HOST=127.0.0.1 bun run start:server
+```
+
+Open <http://localhost:4310>. No Desktop app, macOS-only binary, or Electron
+runtime is involved; the orchestrator runs on the Bun you started the server
+with.
 
 ## Self-host on localhost
 
@@ -108,6 +151,7 @@ security notes below before exposing the port beyond a trusted network.
 | `FREEBUFF_WEB_TLS_CERT`   | none                             | PEM certificate for HTTPS                             |
 | `FREEBUFF_WEB_TLS_KEY`    | none                             | PEM private key; required with the certificate        |
 | `FREEBUFF_APP_PATH`       | auto-detected                    | Freebuff app bundle, `Resources` dir, or orchestrator |
+| `FREEBUFF_RUNTIME_DIR`    | `freebuff/server/runtime`        | Force an exported runtime instead of a Desktop install |
 | `FREEBUFF_DESKTOP_STATE`  | `~/.config/freebuff-desktop/...` | Desktop state used to seed projects on first run      |
 
 To change the password, set `FREEBUFF_WEB_PASSWORD` before starting. The value

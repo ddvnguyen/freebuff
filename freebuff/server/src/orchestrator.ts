@@ -10,6 +10,10 @@ export type FreebuffBundle = {
   wasmDir: string | null
   bun: string
   gitDir: string | null
+  /** ripgrep for this platform, from the app bundle, this repo, or PATH. */
+  rgPath: string | null
+  /** Whether these assets came from an install or the vendored runtime. */
+  source: 'desktop' | 'vendored'
 }
 
 export type ReadyAnnouncement = {
@@ -18,7 +22,7 @@ export type ReadyAnnouncement = {
   port: number
 }
 
-function candidateResources(env: NodeJS.ProcessEnv, home: string): string[] {
+function overrideResourceCandidates(env: NodeJS.ProcessEnv): string[] {
   const candidates: string[] = []
   const override = env.FREEBUFF_APP_PATH?.trim()
   if (override) {
@@ -40,6 +44,14 @@ function candidateResources(env: NodeJS.ProcessEnv, home: string): string[] {
       )
     }
   }
+  return candidates
+}
+
+function desktopResourceCandidates(
+  env: NodeJS.ProcessEnv,
+  home: string,
+): string[] {
+  const candidates: string[] = []
 
   if (process.platform === 'darwin') {
     candidates.push(
@@ -68,6 +80,92 @@ function candidateResources(env: NodeJS.ProcessEnv, home: string): string[] {
   return [...new Set(candidates)]
 }
 
+/** `freebuff/server/runtime`, exported from an installed Desktop app. */
+function vendoredResourcesDir(env: NodeJS.ProcessEnv): string | null {
+  const override = env.FREEBUFF_RUNTIME_DIR?.trim()
+  if (override) return path.resolve(override)
+  const candidate = path.resolve(import.meta.dir, '..', 'runtime')
+  return existsSync(candidate) ? candidate : null
+}
+
+const RG_PLATFORM_DIRS: Record<string, string> = {
+  'darwin-arm64': 'arm64-darwin',
+  'darwin-x64': 'x64-darwin',
+  'linux-arm64': 'arm64-linux',
+  'linux-x64': 'x64-linux',
+  'win32-arm64': 'arm64-win32',
+  'win32-x64': 'x64-win32',
+}
+
+function resolveRipgrep(
+  resourcesDir: string,
+  env: NodeJS.ProcessEnv,
+): string | null {
+  const configured = env.CODEBUFF_RG_PATH?.trim()
+  if (configured) return configured
+
+  const platformDir = RG_PLATFORM_DIRS[`${process.platform}-${process.arch}`]
+  const binary = process.platform === 'win32' ? 'rg.exe' : 'rg'
+  if (platformDir) {
+    const repositoryRoot = path.resolve(import.meta.dir, '../../..')
+    for (const candidate of [
+      path.join(
+        resourcesDir,
+        'orchestrator',
+        'vendor',
+        'ripgrep',
+        platformDir,
+        binary,
+      ),
+      path.join(
+        repositoryRoot,
+        'sdk',
+        'vendor',
+        'ripgrep',
+        platformDir,
+        binary,
+      ),
+    ]) {
+      if (existsSync(candidate)) return candidate
+    }
+  }
+  return Bun.which('rg') ?? null
+}
+
+function bundleAt(
+  resourcesDir: string,
+  env: NodeJS.ProcessEnv,
+  source: FreebuffBundle['source'],
+): FreebuffBundle | null {
+  const orchestratorPath = path.join(
+    resourcesDir,
+    'orchestrator',
+    'orchestrator.js',
+  )
+  const uiDir = path.join(resourcesDir, 'orchestrator', 'ui')
+  if (
+    !existsSync(orchestratorPath) ||
+    !existsSync(path.join(uiDir, 'index.html'))
+  ) {
+    return null
+  }
+
+  const wasmDir = path.join(resourcesDir, 'orchestrator', 'wasm')
+  const hasWasm = existsSync(path.join(wasmDir, 'tree-sitter.wasm'))
+  const gitDir = path.join(resourcesDir, 'git')
+
+  return {
+    resourcesDir,
+    orchestratorPath,
+    uiDir,
+    wasmDir: hasWasm ? wasmDir : null,
+    bun: executableBun(resourcesDir, env),
+    gitDir: existsSync(gitDir) ? gitDir : null,
+    rgPath: resolveRipgrep(resourcesDir, env),
+    source,
+  }
+}
+
 function executableBun(resourcesDir: string, env: NodeJS.ProcessEnv): string {
   const override = env.FREEBUFF_BUN_PATH?.trim()
   if (override) return override
@@ -89,47 +187,81 @@ function executableBun(resourcesDir: string, env: NodeJS.ProcessEnv): string {
   return 'bun'
 }
 
+/** Resolve one explicit app path, without falling back to other installs. */
+export function findFreebuffBundleAt(
+  appPath: string,
+  env: NodeJS.ProcessEnv = process.env,
+): FreebuffBundle | null {
+  const candidates = overrideResourceCandidates({
+    ...env,
+    FREEBUFF_APP_PATH: appPath,
+  })
+  for (const resourcesDir of new Set(candidates)) {
+    const bundle = bundleAt(path.resolve(resourcesDir), env, 'desktop')
+    if (bundle) return bundle
+  }
+  return null
+}
+
+/** Just the installed Desktop app, ignoring the vendored runtime. */
+export function findInstalledFreebuffBundle(
+  env: NodeJS.ProcessEnv = process.env,
+  home = homedir(),
+): FreebuffBundle | null {
+  const candidates = [
+    ...overrideResourceCandidates(env),
+    ...desktopResourceCandidates(env, home),
+  ]
+  for (const resourcesDir of new Set(candidates)) {
+    const bundle = bundleAt(path.resolve(resourcesDir), env, 'desktop')
+    if (bundle) return bundle
+  }
+  return null
+}
+
 export function findFreebuffBundle(
   env: NodeJS.ProcessEnv = process.env,
   home = homedir(),
 ): FreebuffBundle {
-  const tried: string[] = []
-  for (const resourcesDir of candidateResources(env, home)) {
-    if (tried.includes(resourcesDir)) continue
-    tried.push(resourcesDir)
-    const orchestratorPath = path.join(
-      resourcesDir,
-      'orchestrator',
-      'orchestrator.js',
-    )
-    const uiDir = path.join(resourcesDir, 'orchestrator', 'ui')
-    if (
-      !existsSync(orchestratorPath) ||
-      !existsSync(path.join(uiDir, 'index.html'))
-    ) {
-      continue
+  const candidates: Array<{
+    resourcesDir: string
+    source: FreebuffBundle['source']
+  }> = []
+  const add = (resourcesDir: string, source: FreebuffBundle['source']) => {
+    const resolved = path.resolve(resourcesDir)
+    if (!candidates.some((entry) => entry.resourcesDir === resolved)) {
+      candidates.push({ resourcesDir: resolved, source })
     }
+  }
 
-    const wasmDir = path.join(resourcesDir, 'orchestrator', 'wasm')
-    const hasWasm = existsSync(path.join(wasmDir, 'tree-sitter.wasm'))
-    const gitDir = path.join(resourcesDir, 'git')
+  // An explicit runtime wins so it can be used to test an export on a machine
+  // that also has Desktop installed.
+  const explicitRuntime = env.FREEBUFF_RUNTIME_DIR?.trim()
+  if (explicitRuntime) add(explicitRuntime, 'vendored')
+  for (const resourcesDir of overrideResourceCandidates(env)) {
+    add(resourcesDir, 'desktop')
+  }
+  for (const resourcesDir of desktopResourceCandidates(env, home)) {
+    add(resourcesDir, 'desktop')
+  }
+  const vendored = vendoredResourcesDir(env)
+  if (vendored) add(vendored, 'vendored')
 
-    return {
-      resourcesDir,
-      orchestratorPath,
-      uiDir,
-      wasmDir: hasWasm ? wasmDir : null,
-      bun: executableBun(resourcesDir, env),
-      gitDir: existsSync(gitDir) ? gitDir : null,
-    }
+  for (const candidate of candidates) {
+    const bundle = bundleAt(candidate.resourcesDir, env, candidate.source)
+    if (bundle) return bundle
   }
 
   throw new Error(
     [
-      'Freebuff Desktop was not found.',
-      'Install Freebuff Desktop, or point FREEBUFF_APP_PATH at the app bundle',
-      '(/Applications/Freebuff.app on macOS) or its Resources directory.',
-      `Looked in:\n  ${tried.join('\n  ')}`,
+      'Freebuff Desktop was not found and no vendored runtime is available.',
+      'Install Freebuff Desktop, point FREEBUFF_APP_PATH at the app bundle',
+      '(/Applications/Freebuff.app on macOS) or its Resources directory,',
+      'or export the runtime on a machine that has Desktop installed:',
+      '',
+      '  bun --cwd freebuff/server run export-runtime',
+      '',
+      `Looked in:\n  ${candidates.map((entry) => entry.resourcesDir).join('\n  ')}`,
     ].join('\n'),
   )
 }
@@ -189,6 +321,7 @@ function childEnvironment(
     PORT: '0',
     FREEBUFF_UI_DIR: bundle.uiDir,
     FREEBUFF_DESKTOP_STATE_PATH: profilePath,
+    ...(bundle.rgPath ? { CODEBUFF_RG_PATH: bundle.rgPath } : {}),
     // A second server on the same profile must fail fast rather than hang.
     FREEBUFF_PROFILE_LOCK_WAIT_MS: '0',
     // Marks a hand-run (non-Electron) launch for the orchestrator's own logs.
@@ -383,8 +516,21 @@ export async function startOrchestrator(
   }
 }
 
-/** Small helper used by the banner: the Desktop app's version, when readable. */
+/** Small helper used by the banner: version from a runtime manifest or Info.plist. */
 export function readAppVersion(bundle: FreebuffBundle): string | null {
+  const manifestPath = path.join(bundle.resourcesDir, 'manifest.json')
+  if (existsSync(manifestPath)) {
+    try {
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+        version?: unknown
+      }
+      if (typeof manifest.version === 'string' && manifest.version.trim()) {
+        return manifest.version
+      }
+    } catch {
+      // Fall through to the macOS app metadata.
+    }
+  }
   if (process.platform !== 'darwin') return null
   const plist = path.join(path.dirname(bundle.resourcesDir), 'Info.plist')
   if (!existsSync(plist)) return null
