@@ -1,0 +1,16 @@
+{
+  "name": "@codebuff/freebuff-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-host the installed Freebuff Desktop app in a browser",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch src/index.ts",
+    "test": "bun test",
+    "typecheck": "bun x tsc --noEmit -p tsconfig.json"
+  },
+  "engines": {
+    "bun": ">=1.3.0"
+  }
+}

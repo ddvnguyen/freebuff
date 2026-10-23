@@ -20,6 +20,7 @@
     "start-cli": "bun --cwd cli dev",
     "dev": "bun start-cli",
     "dev:freebuff": "FREEBUFF_MODE=true bun --cwd cli dev",
+    "start:server": "bun --cwd freebuff/server start",
     "release:cli": "bun run --cwd=cli release",
     "release:sdk": "bun run --cwd=sdk release",
     "release:freebuff": "bun run --cwd=freebuff release",

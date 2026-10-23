@@ -17,12 +17,28 @@ cd ~/my-project
 freebuff
 ```
 
+## Self-host the Desktop UI
+
+Run the interface of the Freebuff Desktop app you already have installed in a
+browser on this machine:
+
+```bash
+# From the repository root
+bun install
+FREEBUFF_WEB_HOST=127.0.0.1 bun run start:server
+```
+
+Open <http://localhost:4310> and enter the password printed on first run. The
+[server README](server/README.md) covers the one-time browser sign-in, LAN and
+Tailscale access, HTTPS, configuration, and troubleshooting.
+
 ## Project Structure
 
 ```
 freebuff/
 ├── cli/       # CLI build & npm release files
-└── web/       # Freebuff website
+├── server/    # Browser access to the installed Desktop app
+└── e2e/       # End-to-end CLI tests
 ```
 
 ## Building from Source
