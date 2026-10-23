@@ -432,6 +432,11 @@ export function startProxy(options: ProxyOptions): ProxyHandle {
     hostname: options.hostname,
     port: options.port,
     ...(options.tls ? { tls: options.tls } : {}),
+    // Bun closes connections idle for 10s by default. The orchestrator only
+    // pings /api/events every 25s, so a quiet desktop UI would lose its event
+    // stream on every idle interval. Keep the connection open for the longest
+    // interval Bun allows; the orchestrator sets idleTimeout: 0 itself.
+    idleTimeout: 255,
     maxRequestBodySize: 256 * 1024 * 1024,
     fetch: async (request, server) => {
       const url = new URL(request.url)
