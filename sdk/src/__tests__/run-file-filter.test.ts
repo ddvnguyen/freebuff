@@ -70,6 +70,7 @@ describe('CodebuffClientOptions fileFilter', () => {
     spyOn(databaseModule, 'getUserInfoFromApiKey').mockResolvedValue({
       id: 'user-123',
       email: 'test@example.com',
+      name: null,
       discord_id: null,
       stripe_customer_id: null,
       banned: false,
@@ -178,6 +179,11 @@ describe('CodebuffClientOptions fileFilter', () => {
     // Windows are forwarded verbatim, and only when the agent sends them: a
     // base2 read must reach the override with no fileWindows key at all.
     expect(overrideInputs[0]?.fileWindows).toBeUndefined()
+    // Only the edit path's read (requestOptionalFile) asks the override for
+    // the whole file; model reads keep the override's read budget.
+    expect(overrideInputs[0]?.fullContent).toBeUndefined()
+    expect(overrideInputs[1]?.fullContent).toBe(true)
+    expect(overrideInputs[2]?.fullContent).toBeUndefined()
     expect(overrideInputs[2]?.fileWindows).toEqual({
       'src/index.ts': [{ offset: 5, limit: 2 }],
     })
@@ -203,6 +209,7 @@ describe('CodebuffClientOptions fileFilter', () => {
     spyOn(databaseModule, 'getUserInfoFromApiKey').mockResolvedValue({
       id: 'user-123',
       email: 'test@example.com',
+      name: null,
       discord_id: null,
       stripe_customer_id: null,
       banned: false,
@@ -282,6 +289,7 @@ describe('CodebuffClientOptions fileFilter', () => {
     spyOn(databaseModule, 'getUserInfoFromApiKey').mockResolvedValue({
       id: 'user-123',
       email: 'test@example.com',
+      name: null,
       discord_id: null,
       stripe_customer_id: null,
       banned: false,
@@ -364,6 +372,7 @@ describe('CodebuffClientOptions fileFilter', () => {
     spyOn(databaseModule, 'getUserInfoFromApiKey').mockResolvedValue({
       id: 'user-123',
       email: 'test@example.com',
+      name: null,
       discord_id: null,
       stripe_customer_id: null,
       banned: false,
@@ -434,6 +443,7 @@ describe('CodebuffClientOptions fileFilter', () => {
     spyOn(databaseModule, 'getUserInfoFromApiKey').mockResolvedValue({
       id: 'user-123',
       email: 'test@example.com',
+      name: null,
       discord_id: null,
       stripe_customer_id: null,
       banned: false,
@@ -504,6 +514,7 @@ describe('CodebuffClientOptions fileFilter', () => {
     spyOn(databaseModule, 'getUserInfoFromApiKey').mockResolvedValue({
       id: 'user-123',
       email: 'test@example.com',
+      name: null,
       discord_id: null,
       stripe_customer_id: null,
       banned: false,

@@ -4,8 +4,14 @@ import path from 'path'
 import { getCiEnv } from '@codebuff/common/env-ci'
 import { z } from 'zod'
 
+import {
+  getCachedKeychainToken,
+  resolveSecretStore,
+  setCachedKeychainToken,
+} from './auth-token-store'
 import { getApiClient, setApiClientAuthToken } from './codebuff-api'
 import { getConfigDir as getConfigDirBase } from './config-dir'
+import { IS_FREEBUFF } from './constants'
 import { logger } from './logger'
 
 import type { CiEnv } from '@codebuff/common/types/contracts/env'
@@ -30,11 +36,16 @@ const userSchema = z.object({
 
 export type User = z.infer<typeof userSchema>
 
-const credentialsSchema = z
-  .object({
-    default: userSchema.optional(),
-  })
-  .catchall(z.unknown())
+/** What the file may hold: the token itself, or a pointer to the keychain
+ *  (auth-token-store.ts). */
+const storedUserSchema = userSchema.extend({
+  authToken: z.string().optional(),
+  tokenStore: z.literal('keychain').optional(),
+})
+
+// Each profile is validated on its own (`storedUserSchema` in userFromJson):
+// a keychain-pointer profile has no `authToken`, which `userSchema` requires.
+const credentialsSchema = z.object({}).catchall(z.unknown())
 
 // Get the config directory path.
 // Re-exported as a wrapper (rather than a bare `export ... from`) so existing
@@ -54,10 +65,12 @@ const CONFIG_DIR_MODE = 0o700
 /**
  * Best-effort: clamp the credentials file to owner read/write.
  *
- * `writeFileSync` only applies `mode` when it CREATES the file, so an install
- * that already has a umask-wide `credentials.json` (e.g. `-rw-rw-r--`) keeps
- * it across every rewrite. Called after each write and on read, so existing
- * installs are healed on the next launch. Skipped on Windows, where POSIX
+ * `writeFileSync` only applies `mode` when it CREATES the file, and the
+ * process umask can still clear bits from the mode it is given, so the mode
+ * is also asserted here. Called on each write's temp file -- the mode rides
+ * the inode across the rename onto the real file -- and on read, so an
+ * install that already has a umask-wide `credentials.json` (e.g.
+ * `-rw-rw-r--`) is healed on the next launch. Skipped on Windows, where POSIX
  * mode bits do not apply and `chmod` can throw. Never throws: a failed chmod
  * must not cost the user their login.
  */
@@ -77,6 +90,81 @@ const tightenCredentialsFileMode = (credentialsPath: string): void => {
 }
 
 /**
+ * Replace `credentials.json` atomically: write a sibling temp file, then
+ * `rename` it over the real one.
+ *
+ * `fs.writeFileSync` truncates the destination and then writes it, so for the
+ * whole write there is a zero-length or half-written file on disk. Every
+ * running CLI re-reads this file on EVERY render (`getUserCredentials()` is
+ * called from the render body), the public SDK reads it too, and users
+ * demonstrably run several clients at once -- so a reader that lands in that
+ * window parses a truncated file, and `getUserCredentials()` returns null:
+ * a signed-in user reads as signed out until the next render. In production
+ * that is the `JSON Parse error: Unexpected EOF` / `Expected '}'` /
+ * `Unterminated string` variant of "Error parsing user JSON": 55 distinct
+ * users in 30 days, and that is a floor, since each process logs a given
+ * failure once (`logCredentialsFailureOnce`). A writer killed mid-write left
+ * the file corrupt for good.
+ *
+ * `rename(2)` within one directory is atomic: a reader sees either the whole
+ * old file or the whole new one, never a partial one. Node's `renameSync`
+ * replaces an existing destination on Windows as well. The temp file is
+ * created owner-only and tightened before the rename, so the token is never
+ * briefly group/other-readable, and the mode rides the inode across the
+ * rename. A failed write leaves the previous file untouched.
+ */
+const writeCredentialsFileAtomic = (
+  credentialsPath: string,
+  contents: string,
+): void => {
+  // Same directory, so the rename stays within one filesystem. The pid keeps
+  // two concurrent CLIs off each other's temp file.
+  const tempPath = `${credentialsPath}.${process.pid}.tmp`
+  try {
+    fs.writeFileSync(tempPath, contents, { mode: CREDENTIALS_FILE_MODE })
+    tightenCredentialsFileMode(tempPath)
+    fs.renameSync(tempPath, credentialsPath)
+  } catch (error) {
+    // Best-effort: never leave a temp file holding the token behind.
+    try {
+      fs.rmSync(tempPath, { force: true })
+    } catch {}
+    throw error
+  }
+}
+
+/**
+ * Distinct credentials read/parse failures already logged by this process.
+ *
+ * The credentials file is re-read on every render of the app shell
+ * (`useAuthQuery` / `useAuthState` call `getUserCredentials()` in the render
+ * body), so a file this process cannot parse used to log an error on every
+ * frame. On 2026-10-01 a pre-0.2.4 CLI left running beside a 0.2.4 one (which
+ * moved the token to the keychain) logged "Error parsing user JSON" ~11 times
+ * a second per user, 35k lines per 20 minutes. One line per distinct failure
+ * says everything; the rest is ingest cost. Bounded so a file that changes
+ * shape forever cannot grow it without limit.
+ */
+const loggedCredentialsFailures = new Set<string>()
+const MAX_LOGGED_CREDENTIALS_FAILURES = 20
+
+const logCredentialsFailureOnce = (
+  key: string,
+  data: Record<string, unknown>,
+  message: string,
+): void => {
+  if (loggedCredentialsFailures.has(key)) return
+  if (loggedCredentialsFailures.size >= MAX_LOGGED_CREDENTIALS_FAILURES) return
+  loggedCredentialsFailures.add(key)
+  logger.error(data, message)
+}
+
+/** Test-only: forget which credentials failures were already logged. */
+export const resetCredentialsFailureLogForTests = (): void => {
+  loggedCredentialsFailures.clear()
+}
+
+/**
  * Parse user from JSON string
  */
 const userFromJson = (
@@ -87,12 +175,21 @@ const userFromJson = (
     const allCredentials = credentialsSchema.parse(JSON.parse(json))
     const profile = allCredentials[profileName]
     // Validate that the profile matches the user schema
-    const parsed = userSchema.safeParse(profile)
-    return parsed.success ? parsed.data : undefined
+    const parsed = storedUserSchema.safeParse(profile)
+    if (!parsed.success) return undefined
+    const { tokenStore, ...stored } = parsed.data
+    // A keychain pointer resolves to the token loaded at startup; with none
+    // loaded (keychain unavailable this run) the user reads as signed out.
+    const authToken =
+      stored.authToken ??
+      (tokenStore === 'keychain' ? getCachedKeychainToken() : undefined)
+    return authToken ? { ...stored, authToken } : undefined
   } catch (error) {
-    logger.error(
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    logCredentialsFailureOnce(
+      `parse:${profileName}:${errorMessage}`,
       {
-        errorMessage: error instanceof Error ? error.message : String(error),
+        errorMessage,
         errorStack: error instanceof Error ? error.stack : undefined,
         profileName,
       },
@@ -120,10 +217,10 @@ export const getUserCredentials = (): User | null => {
     const user = userFromJson(credentialsFile)
     return user || null
   } catch (error) {
-    logger.error(
-      {
-        error: error instanceof Error ? error.message : String(error),
-      },
+    const message = error instanceof Error ? error.message : String(error)
+    logCredentialsFailureOnce(
+      `read:${message}`,
+      { error: message },
       'Error reading credentials',
     )
     return null
@@ -161,18 +258,6 @@ export const getAuthTokenDetails = (
  */
 export const getAuthToken = (): string | undefined => {
   return getAuthTokenDetails().token
-}
-
-/**
- * Check if the user has authentication credentials (but doesn't validate them)
- */
-export const hasAuthCredentials = (): boolean => {
-  return !!getAuthTokenDetails().token
-}
-
-export interface AuthValidationResult {
-  authenticated: boolean
-  hasInvalidCredentials: boolean
 }
 
 /**
@@ -214,10 +299,13 @@ export const saveUserCredentials = (user: User): void => {
     // The login response is cast to `User`, so `name` can be null at runtime.
     const normalizedUser = { ...user, name: user.name ?? '' }
     const updatedData = { ...readCredentialsFile(), default: normalizedUser }
-    fs.writeFileSync(credentialsPath, JSON.stringify(updatedData, null, 2), {
-      mode: CREDENTIALS_FILE_MODE,
-    })
-    tightenCredentialsFileMode(credentialsPath)
+    writeCredentialsFileAtomic(
+      credentialsPath,
+      JSON.stringify(updatedData, null, 2),
+    )
+    // The file holds the token until the keychain has it (never throws).
+    setCachedKeychainToken(normalizedUser.authToken)
+    void moveTokenToKeychain()
   } catch (error) {
     logger.error(
       {
@@ -240,14 +328,24 @@ export const clearUserCredentials = (): void => {
     if (!fs.existsSync(credentialsPath)) return
 
     const { default: _, ...rest } = readCredentialsFile()
+    setCachedKeychainToken(null)
+    const store = resolveSecretStore({
+      isFreebuff: IS_FREEBUFF,
+      credentialsPath,
+    })
+    if (store) {
+      void store.delete().catch((error) => {
+        logger.debug(
+          { error: error instanceof Error ? error.message : String(error) },
+          'Could not remove the keychain token',
+        )
+      })
+    }
 
     if (Object.keys(rest).length === 0) {
       fs.unlinkSync(credentialsPath)
     } else {
-      fs.writeFileSync(credentialsPath, JSON.stringify(rest, null, 2), {
-        mode: CREDENTIALS_FILE_MODE,
-      })
-      tightenCredentialsFileMode(credentialsPath)
+      writeCredentialsFileAtomic(credentialsPath, JSON.stringify(rest, null, 2))
     }
   } catch (error) {
     logger.error(
@@ -257,6 +355,71 @@ export const clearUserCredentials = (): void => {
       'Error clearing credentials',
     )
     throw error
+  }
+}
+
+/**
+ * Move the file's token into the keychain, once the keychain has proved it
+ * can hand it back. Leaves the file alone on any failure, and when the file
+ * changed meanwhile (a concurrent login). Never throws.
+ */
+export async function moveTokenToKeychain(): Promise<boolean> {
+  const credentialsPath = getCredentialsPath()
+  const store = resolveSecretStore({ isFreebuff: IS_FREEBUFF, credentialsPath })
+  if (!store) return false
+  try {
+    const before = readCredentialsFile()
+    const profile = storedUserSchema.safeParse(before.default)
+    const token = profile.success ? profile.data.authToken : undefined
+    if (!token) return false
+    await store.set(token)
+    if ((await store.get()) !== token) return false
+    const now = readCredentialsFile()
+    const current = storedUserSchema.safeParse(now.default)
+    if (!current.success || current.data.authToken !== token) return false
+    const { authToken: _moved, ...profileOnly } = current.data
+    writeCredentialsFileAtomic(
+      credentialsPath,
+      JSON.stringify(
+        { ...now, default: { ...profileOnly, tokenStore: 'keychain' } },
+        null,
+        2,
+      ),
+    )
+    setCachedKeychainToken(token)
+    return true
+  } catch (error) {
+    logger.debug(
+      { error: error instanceof Error ? error.message : String(error) },
+      'Auth token stays in the credentials file (keychain unavailable)',
+    )
+    return false
+  }
+}
+
+/**
+ * Startup: load a keychain token into memory so the synchronous readers see
+ * it, or move a file token into the keychain. Must run before anything reads
+ * the credentials. Never throws.
+ */
+export async function loadStoredAuthToken(): Promise<void> {
+  const credentialsPath = getCredentialsPath()
+  const store = resolveSecretStore({ isFreebuff: IS_FREEBUFF, credentialsPath })
+  if (!store) return
+  const profile = storedUserSchema.safeParse(readCredentialsFile().default)
+  if (!profile.success) return
+  if (profile.data.authToken) {
+    await moveTokenToKeychain()
+    return
+  }
+  if (profile.data.tokenStore !== 'keychain') return
+  try {
+    setCachedKeychainToken((await store.get()) ?? null)
+  } catch (error) {
+    logger.warn(
+      { error: error instanceof Error ? error.message : String(error) },
+      'Could not read the auth token from the keychain',
+    )
   }
 }
 

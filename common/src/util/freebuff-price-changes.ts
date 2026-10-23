@@ -2,9 +2,12 @@ import type {
   FreebuffFreebucksInfo,
   FreebuffOffPeakPrice,
 } from '../types/freebuff-session'
-import { discountedSessionPrice } from './freebuff-first-tab-discount'
+import { isBeijingWeekend } from '../constants/freebuff-peak-hours'
+import { freebuffMultiplierText } from './freebuff-hours'
 
-/** Resolve a server-owned daily policy, including windows crossing midnight. */
+/** Resolve a server-owned daily policy, including windows crossing midnight
+ *  and, when the policy says so, weekends that are off-peak all day. `start`
+ *  and `end` are the current or next DAILY window, for copy. */
 export function offPeakPriceAt(offer: FreebuffOffPeakPrice, now: number) {
   const start = new Date(now)
   start.setUTCHours(offer.startHourUtc, 0, 0, 0)
@@ -12,20 +15,71 @@ export function offPeakPriceAt(offer: FreebuffOffPeakPrice, now: number) {
   const end = new Date(start)
   end.setUTCHours(offer.endHourUtc, 0, 0, 0)
   if (+end <= +start) end.setUTCDate(end.getUTCDate() + 1)
-  const active = now < +end
-  if (!active) {
+  const inDailyWindow = now < +end
+  if (!inDailyWindow) {
     start.setUTCDate(start.getUTCDate() + 1)
     end.setUTCDate(end.getUTCDate() + 1)
   }
+  const active = isOffPeakAt(offer, now)
   return {
     start,
     end,
-    nextChangeAt: active ? +end : +start,
+    nextChangeAt: nextPriceChangeAt(offer, now, active),
     price: active ? offer.price : offer.regularPrice,
     tagline: active
-      ? `Off-peak pricing · ${offer.regularPrice} Freebucks/hour at peak`
-      : `Peak pricing · ${offer.price} Freebucks/hour off-peak`,
+      ? `Off-peak pricing · ${freebuffMultiplierText(offer.regularPrice)} at peak`
+      : `Peak pricing · ${freebuffMultiplierText(offer.price)} off-peak`,
   }
+}
+
+/** Whether `at` is priced off-peak under `offer`: inside the daily UTC
+ *  window, which may cross midnight, or on a Beijing weekend when the policy
+ *  extends to weekends. */
+function isOffPeakAt(offer: FreebuffOffPeakPrice, at: number): boolean {
+  if (offer.weekendsOffPeak === true && isBeijingWeekend(new Date(at)))
+    return true
+  const hour = new Date(at).getUTCHours()
+  const { startHourUtc: start, endHourUtc: end } = offer
+  return start < end ? hour >= start && hour < end : hour >= start || hour < end
+}
+
+/** The first instant after `now` at which the quoted price changes. Policies
+ *  only change on the hour, so walk hour boundaries; a weekend can hold one
+ *  price for two and a half days, so look more than a week ahead before
+ *  giving up (a 24-hour window never changes, and then the far edge is fine). */
+function nextPriceChangeAt(
+  offer: FreebuffOffPeakPrice,
+  now: number,
+  active: boolean,
+): number {
+  const boundary = new Date(now)
+  boundary.setUTCMinutes(0, 0, 0)
+  for (let step = 0; step < 24 * 8; step++) {
+    boundary.setUTCHours(boundary.getUTCHours() + 1)
+    if (isOffPeakAt(offer, +boundary) !== active) break
+  }
+  return +boundary
+}
+
+/** The policy's runs of one price over the coming week, each `[start, end)`.
+ *  Every run is whole: the scan starts a day back and drops the partial runs
+ *  at either end, so the first is the current or next one. */
+export function offPeakRuns(
+  offer: FreebuffOffPeakPrice,
+  now: number,
+): { start: number; end: number; offPeak: boolean }[] {
+  const hour = 60 * 60 * 1000
+  const from = Math.floor(now / hour) * hour - 24 * hour
+  const runs: { start: number; end: number; offPeak: boolean }[] = []
+  for (let at = from; at < from + 9 * 24 * hour; at += hour) {
+    const offPeak = isOffPeakAt(offer, at)
+    const last = runs[runs.length - 1]
+    if (last?.offPeak === offPeak) last.end = at + hour
+    else runs.push({ start: at, end: at + hour, offPeak })
+  }
+  return runs
+    .slice(1, -1)
+    .filter((run) => run.end > now && run.start < now + 7 * 24 * hour)
 }
 
 /** Apply the SERVER'S dated changes and recurring policies to new-session
@@ -33,23 +87,17 @@ export function offPeakPriceAt(offer: FreebuffOffPeakPrice, now: number) {
 export function applyFreebucksPriceChanges<
   T extends Pick<
     FreebuffFreebucksInfo,
-    'prices' | 'listPrices' | 'priceNotices' | 'priceChanges' | 'firstTabDiscount' | 'offPeak'
+    'prices' | 'priceNotices' | 'priceChanges' | 'offPeak'
   >,
 >(info: T, now = Date.now()): T {
-  const due = info.priceChanges?.filter((change) => Date.parse(change.at) <= now)
+  const due = info.priceChanges?.filter(
+    (change) => Date.parse(change.at) <= now,
+  )
   let prices = info.prices
-  let listPrices = info.listPrices
   let priceNotices = info.priceNotices
   const apply = (modelId: string, price: number, tagline: string) => {
     if (prices[modelId] === undefined) return
-    const discounted = discountedSessionPrice(
-      price,
-      info.firstTabDiscount?.available ? info.firstTabDiscount.amount : 0,
-    )
-    if (prices[modelId] !== discounted)
-      prices = { ...prices, [modelId]: discounted }
-    if (listPrices && listPrices[modelId] !== price)
-      listPrices = { ...listPrices, [modelId]: price }
+    if (prices[modelId] !== price) prices = { ...prices, [modelId]: price }
     if (priceNotices?.[modelId] !== tagline)
       priceNotices = { ...priceNotices, [modelId]: tagline }
   }
@@ -66,14 +114,12 @@ export function applyFreebucksPriceChanges<
   if (
     !due?.length &&
     prices === info.prices &&
-    listPrices === info.listPrices &&
     priceNotices === info.priceNotices
   )
     return info
   return {
     ...info,
     prices,
-    ...(listPrices ? { listPrices } : {}),
     priceNotices,
     priceChanges: info.priceChanges?.filter(
       (change) => Date.parse(change.at) > now,

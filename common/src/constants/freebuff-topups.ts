@@ -191,9 +191,6 @@ export function advertiserPlacementCpcBand(params: {
   }
 }
 
-/** A single automatic reprice may move at most 25% in either direction. */
-export const AD_PLACEMENT_CPC_REPRICE_MAX_MOVE_BPS = 2_500
-
 /** Thin samples are reported, but never allowed to move money automatically. */
 export const AD_PLACEMENT_CPC_REPRICE_MIN_CLICKS = 50
 
@@ -307,6 +304,15 @@ export const AD_SPEND_LEDGER_REASONS = [
   'promo_credit',
   /** Unspent promotional balance removed at expiry or after a reversal. */
   'promo_reversal',
+  /**
+   * One charged click credited back by the hourly invalid-traffic sweep
+   * (`packages/internal/src/ad-click-fraud-sweep.ts`), id
+   * `ivt_refund_<impressionId>`. Positive, campaign-scoped. Kept apart from
+   * `refund` so the sweep's automatic credits can be counted and audited on
+   * their own; the statement shows both as refunds. See
+   * docs/ads/invalid-traffic.md.
+   */
+  'invalid_traffic_credit',
 ] as const
 export type AdSpendLedgerReason = (typeof AD_SPEND_LEDGER_REASONS)[number]
 
@@ -342,6 +348,7 @@ export function statementKindForReason(
     return 'adjustment'
   }
   if (reason === 'promo_credit') return 'adjustment'
+  if (reason === 'invalid_traffic_credit') return 'refund'
   return reason
 }
 
@@ -350,6 +357,7 @@ export function isCreditReason(reason: AdSpendLedgerReason): boolean {
   return (
     reason === 'topup' ||
     reason === 'refund' ||
+    reason === 'invalid_traffic_credit' ||
     reason === 'collection' ||
     reason === 'promo_credit'
   )

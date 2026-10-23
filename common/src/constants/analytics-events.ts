@@ -2,6 +2,10 @@
  * Enum of analytics event types used throughout the application
  */
 export enum AnalyticsEvent {
+  // Authenticated mapped-project consent funnel. Views require 50% visible
+  // for one foreground second; choices are logged after the gateway saves.
+  PROJECT_CONTRIBUTION_VIEWED = 'project_contribution_viewed',
+  PROJECT_CONTRIBUTION_CHOICE_SAVED = 'project_contribution_choice_saved',
   // Cross-surface — DAU
   // Emitted exactly once per user-submitted message/prompt, on each surface,
   // and never sampled. `distinct_id` is the canonical codebuff Postgres user
@@ -9,12 +13,13 @@ export enum AnalyticsEvent {
   // per-surface DAU (filter on the `surface` property) and a combined DAU (no
   // filter). The `surface` property is one of: cli, web, chat, desktop, cloud
   // (web = the freebuff.com builder, cloud = connected-repo builder projects).
-  // Native sends additionally carry `client_platform: 'ios' | 'android'`;
-  // surface still describes the mode, and missing platform means unknown.
+  // A native app's send reports its platform instead, ios or android, from
+  // any screen (messageSentSurface).
   // Emission points: cli client analytics; chat's stream route (server-side);
   // desktop's analytics module; web/cloud via the Convex send mutation
   // (PostHog + Axiom, both direct from Convex — see convex/analytics.ts).
   MESSAGE_SENT = 'message_sent',
+  PRODUCT_FUNNEL_STEP = 'freebuff.product_funnel_step',
 
   // Cross-surface — engaged time
   // Emitted once per minute of *active engagement* on each surface (cli / web /
@@ -26,6 +31,14 @@ export enum AnalyticsEvent {
   // user = "Average count per user" broken down by `surface`. See
   // common/src/util/engagement-tracker.ts.
   PRODUCT_ACTIVE_MINUTE = 'product_active_minute',
+
+  // Freebuff Cloud feature use: one event per publish, member invite,
+  // integration, custom link, AI credential connect or delivery step.
+  // Emitted from Convex's `recordCloudFeatureUsage` (PostHog + Axiom, via
+  // convex/analytics.ts) under the canonical codebuff user id. Properties:
+  // `feature` (one of CLOUD_FEATURES) and `project_id` (the Convex project id)
+  // when the use belongs to a project. Never carries the branch or PR detail.
+  CLOUD_FEATURE_USED = 'cloud_feature_used',
 
   // CLI
   APP_LAUNCHED = 'cli.app_launched',
@@ -59,6 +72,12 @@ export enum AnalyticsEvent {
   CLI_HELPER_PROCESS_FLOOD = 'cli.helper_process_flood',
   CLI_HELPER_OUTLIVED_PARENT = 'cli.helper_outlived_parent',
   UPDATE_CODEBUFF_FAILED = 'cli.update_codebuff_failed',
+  // A fatal exit (uncaught exception / unhandled rejection) of the PREVIOUS
+  // launch, shipped by the next one: the crashing process can only write a
+  // local report before process.exit. Bounded payload: label, error name,
+  // truncated message and top stack frames, crashed version, platform,
+  // uptime, and whether a Freebuff hour was held (resumable).
+  CLI_FATAL_CRASH = 'cli.fatal_crash',
   FEEDBACK_BUTTON_HOVERED = 'cli.feedback_button_hovered',
   FOLLOWUP_CLICKED = 'cli.followup_clicked',
   SUGGESTED_PROMPT_SHOWN = 'cli.suggested_prompt_shown',
@@ -178,12 +197,17 @@ export enum AnalyticsEvent {
   // Feedback hub - the Axiom mirror (docs/freebuff-feedback-hub.md §14).
   // One row per feedback_item the hub inserted or changed, from EVERY source:
   // support email, Discord, GitHub, the in-product forms, CLI and Desktop.
-  // This is the event to query when you want to know what users are saying.
+  // STOPPED 2026-10-06 with the frozen hub; kept so its history stays promoted
+  // to the `event` column.
   FEEDBACK_ITEM_INGESTED = 'feedback.item_ingested',
   // Emitted at the door by the surface that RECEIVED the message, so a
-  // submission is queryable even when the hub write fails or Convex is
-  // unconfigured. Deliberately a different name from the hub mirror above:
-  // one means "a person pressed send", the other "the hub holds this".
+  // submission is queryable even when the store write fails or Convex is
+  // unconfigured. Three doors tell themselves apart by `data.source`: the
+  // CLI/Desktop/SDK POST (`cli` | `desktop` | `sdk`), the in-app issue form
+  // (`issue_report`) and the in-app feedback widget (`feedback_message`).
+  // Read it with `scripts/logs/feedback-stream.ts`. Deliberately a different
+  // name from the hub mirror above: one means "a person pressed send", the
+  // other "the hub holds this".
   FEEDBACK_RECEIVED = 'feedback.received',
 
   // Web - Logs ingest API (client logs/events → BigQuery)
@@ -198,6 +222,9 @@ export enum AnalyticsEvent {
   ADS_CLICKED = 'ads.clicked',
   ADS_FIRST_PARTY_DECISION = 'ads.first_party_decision',
   ADS_FIRST_PARTY_SETTLEMENT = 'ads.first_party_settlement',
+  // Provider-ledger snapshot. Keep the latest fetched_at per UTC day before
+  // summing; today's row is explicitly partial. No per-user identity.
+  ADS_GRAVITY_REVENUE_DAILY = 'ads.gravity_revenue_daily',
   ADS_FIRST_PARTY_VIEW_ACK = 'ads.first_party_view_ack',
   /**
    * The CLI dock was expanded into its detail panel (COD-457). A UI gesture,
@@ -285,11 +312,9 @@ export enum AnalyticsEvent {
   // support case is undiagnosable — the guards otherwise return silently.
   FREEBUFF_REFERRAL_REDEEM_FAILED = 'freebuff.referral.redeem_failed',
   // Attribution went through and the referred user redeemed from an IP or
-  // browser the REFERRER was recently seen on. Evidence, NOT a verdict: this
-  // is also exactly what a genuine in-person referral looks like ("try it,
-  // here's my laptop" — a sibling on the family computer shares both). Only
-  // suspicious when corroborated by real farm signals (dormant GitHub, burst
-  // velocity, no product use); the sweep + scripts do that weighing.
+  // browser the REFERRER was recently seen on. Informational only: this is
+  // also exactly what a genuine in-person referral looks like ("try it,
+  // here's my laptop").
   FREEBUFF_REFERRAL_SOCK_SIGNAL = 'freebuff.referral.sock_signal',
   // Freebuff - Get Started Page (referral onboarding funnel, in order:
   //   viewed → sign_in_clicked → signed_in → eligibility_resolved →
@@ -299,6 +324,8 @@ export enum AnalyticsEvent {
   FREEBUFF_GET_STARTED_VIEWED = 'freebuff.get_started_viewed',
   FREEBUFF_GET_STARTED_SIGN_IN_CLICKED = 'freebuff.get_started_sign_in_clicked',
   FREEBUFF_GET_STARTED_SIGNED_IN = 'freebuff.get_started_signed_in',
+  FREEBUFF_EMAIL_AUTH = 'freebuff.email_auth',
+  FREEBUFF_AUTH_STEP = 'freebuff.auth_step',
   FREEBUFF_GET_STARTED_ELIGIBILITY_RESOLVED = 'freebuff.get_started_eligibility_resolved',
   FREEBUFF_GET_STARTED_CONNECT_GITHUB_CLICKED = 'freebuff.get_started_connect_github_clicked',
   FREEBUFF_GET_STARTED_INSTALL_COMMAND_COPIED = 'freebuff.get_started_install_command_copied',
@@ -307,12 +334,19 @@ export enum AnalyticsEvent {
   FREEBUFF_GET_STARTED_HELP_EXPANDED = 'freebuff.get_started_help_expanded',
   FREEBUFF_GET_STARTED_EDITOR_CLICKED = 'freebuff.get_started_editor_clicked',
 
+  // Paid signup destinations. A handoff arrival is not a signup; compare the
+  // signed-out entry with canonical web.signup and message_sent conversions.
+  FREEBUFF_START_VIEWED = 'freebuff.start_viewed',
+  FREEBUFF_START_SIGN_IN_CLICKED = 'freebuff.start_sign_in_clicked',
+  FREEBUFF_START_SIGNED_IN = 'freebuff.start_signed_in',
+
   // Freebuff - Chat
   // Emitted once per new-thread title generation attempt (server-side). The
   // `outcome` property is one of: generated | empty | unknown_model | error |
   // aborted. Carries `latencyMs`, `model`, and `titleLength` so the failure/
   // fallback rate and added latency are queryable.
   FREEBUFF_CHAT_TITLE_GENERATED = 'freebuff.chat_title_generated',
+  FREEBUFF_TITLE_RATE_LIMITED = 'api.freebuff_title_rate_limited',
 
   // Freebuff - CLI landing page (/cli). Fired when the install command is
   // copied; `location` distinguishes hero vs install section. Lets us measure
@@ -352,21 +386,15 @@ export enum AnalyticsEvent {
   // people bail on. `_FINISHED` carries `answered` (0-4) and `sent`.
   FREEBUFF_WEB_ONBOARDING_STEP = 'freebuff.web_onboarding_step',
   FREEBUFF_WEB_ONBOARDING_FINISHED = 'freebuff.web_onboarding_finished',
+  // PostHog's own person-update event: carries only `$set`, so it updates the
+  // person (here `onboarding_source`) without adding a custom event.
+  PERSON_PROPERTIES_SET = '$set',
 
   // The workspace spotlight tour that follows the first build. `_STEP` fires
   // per pane shown (preview/database/logs/publish/chat); `_FINISHED` records
   // completed vs skipped and where they stopped.
   FREEBUFF_WEB_TOUR_STEP = 'freebuff.web_tour_step',
   FREEBUFF_WEB_TOUR_FINISHED = 'freebuff.web_tour_finished',
-
-  // The bookmark gate: a blocking card shown once per browser, right after the
-  // user's first prompt in a Web or Cloud workspace, asking them to bookmark
-  // the page before continuing. `surface` is web | cloud and `variant` is
-  // pointer | touch (the two illustrations). `_SHOWN` minus `_CONFIRMED` is the
-  // abandon rate — the number to watch, since the card has no other exit and a
-  // gap between the two means people are closing the tab instead.
-  FREEBUFF_BOOKMARK_GATE_SHOWN = 'freebuff.bookmark_gate_shown',
-  FREEBUFF_BOOKMARK_GATE_CONFIRMED = 'freebuff.bookmark_gate_confirmed',
 
   // Freebuff - Cloud landing page (/cloud). Fired when a logged-out visitor
   // clicks a "Continue with GitHub" / "Connect your repo" CTA; `location`
@@ -380,6 +408,12 @@ export enum AnalyticsEvent {
   FREEBUFF_HOME_GITHUB_CLICKED = 'freebuff.home_github_clicked',
   FREEBUFF_HOME_INSTALL_GUIDE_EXPANDED = 'freebuff.home_install_guide_expanded',
   FREEBUFF_HOME_FAQ_OPENED = 'freebuff.home_faq_opened',
+
+  // Freebuff - Home hero: the visitor committed to a product (`tab`, `surface`,
+  // `action`; see HeroTabs.tsx). A hero Desktop download is instead
+  // FREEBUFF_DESKTOP_DOWNLOAD_CLICKED at HOME_HERO_DOWNLOAD_LOCATION.
+  // Report: `bun scripts/home-hero-funnel.ts`.
+  FREEBUFF_HOME_HERO_SURFACE_CHOSEN = 'freebuff.home_hero_surface_chosen',
 
   // Freebuff - Home savings calculator CTA. Fires alongside
   // FREEBUFF_DESKTOP_DOWNLOAD_CLICKED (location: savings_calculator) but adds
@@ -439,8 +473,12 @@ export enum AnalyticsEvent {
   DESKTOP_THREAD_CREATED = 'desktop.thread_created',
   DESKTOP_THREAD_TITLED = 'desktop.thread_titled',
   DESKTOP_PROJECT_OPENED = 'desktop.project_opened',
+  // Actual first successful creation; intent distinguishes automatic launch drafts from explicit actions.
+  DESKTOP_PROJECT_CREATED = 'desktop.project_created',
   DESKTOP_PROJECT_REMOVED = 'desktop.project_removed',
   DESKTOP_TURN_COMPLETED = 'desktop.turn_completed',
+  DESKTOP_FUNNEL_STEP = 'desktop.funnel_step',
+  DESKTOP_ACQUISITION_STEP = 'desktop.acquisition_step',
   DESKTOP_FAILED_TURN_RECOVERY = 'desktop.failed_turn_recovery',
   DESKTOP_HARNESS_CHANGED = 'desktop.harness_changed',
   DESKTOP_MODEL_CHANGED = 'desktop.model_changed',
@@ -449,7 +487,7 @@ export enum AnalyticsEvent {
   // Feature-adoption catch-all. ONE event for the long tail of desktop
   // features (panels, worktrees, diffs, skills, terminal, preview, …), keyed
   // by a bounded `feature` property from
-  // `freebuff-desktop/src/core/features.ts`. A single PostHog insight
+  // `freebuff-desktop/src/shared/features.ts`. A single PostHog insight
   // ("desktop.feature_used, broken down by feature", unique users) answers
   // "what do people actually use?" for the whole app, and adding a feature
   // never means adding an event to this enum or to the sampling lists.
@@ -460,6 +498,9 @@ export enum AnalyticsEvent {
   DESKTOP_FEATURE_USED = 'desktop.feature_used',
   DESKTOP_AUTORUN_TOGGLED = 'desktop.autorun_toggled',
   DESKTOP_AUTORUN_SCOPE_SET = 'desktop.autorun_scope_set',
+  // One per project understanding Desktop attempts, with its outcome (not_due,
+  // check_failed, reported, …): services/project-understanding.ts.
+  DESKTOP_PROJECT_UNDERSTANDING = 'desktop.project_understanding',
   // One-shot per process: which codex CLI the Codex harness resolved (or why
   // none). Answers "is the packaged app finding users' codex?" in the field,
   // where the stdout breadcrumb is unavailable.
@@ -471,9 +512,20 @@ export enum AnalyticsEvent {
   // MAX_MESSAGE_AD_COUNT); historical rows exist but nothing emits it. The
   // CLI's `cli.inline_ad_pool_reused` sibling remains Axiom-only.
   DESKTOP_AD_SHOWN = 'desktop.ad_shown',
+  /** Disjoint focused/visible chat milliseconds and physical ad-count integrals. Axiom only. */
+  DESKTOP_AD_DENSITY = 'desktop.ad_density',
   ADS_SHOWCASE_PRESENTED = 'ads.showcase_presented',
   DESKTOP_AD_CLICKED = 'desktop.ad_clicked',
   DESKTOP_INLINE_AD_SLOT_ELIGIBLE = 'desktop.inline_ad_slot_eligible',
+  // Mock display-ad placements (common/src/ads/display-ads/telemetry.ts):
+  // analytics ONLY. Every row carries mock_creative: true and billable: false;
+  // nothing is served behind them, so no ad_impression / ledger row, view ack
+  // or ads.impression_recorded / desktop.ad_shown is ever written for one.
+  DISPLAY_AD_IMPRESSION = 'display_ads.impression',
+  DISPLAY_AD_CLICK = 'display_ads.click',
+  DISPLAY_AD_DISMISS = 'display_ads.dismiss',
+  DISPLAY_AD_RESTORE = 'display_ads.restore',
+  DISPLAY_AD_ACTION = 'display_ads.action',
   // Shutdown/crash lifecycle of harness CLI children: turns aborted at quit so
   // their CLIs terminate, orphans from a dead orchestrator reaped at launch,
   // and interrupted turns auto-resumed by recovery. Together these answer "how
@@ -514,3 +566,5 @@ export enum AnalyticsEvent {
   // Common
   FLUSH_FAILED = 'common.flush_failed',
 }
+
+export const HOME_HERO_DOWNLOAD_LOCATION = 'home_hero'

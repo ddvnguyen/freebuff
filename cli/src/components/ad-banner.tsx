@@ -20,7 +20,12 @@ import { visibleWaitingRoomPlacementIds } from '@codebuff/common/ads/waiting-roo
 import { safeOpen } from '../utils/open-url'
 import React, { useState, useMemo, useEffect } from 'react'
 
+import { greptileTerminalColors } from '../ads/partner-brand'
+import { layoutTruncated } from '../ads/ad-engagement'
+import { useAdEngagement } from '../ads/use-ad-engagement'
+
 import { Button } from './button'
+import { AdReportButton, AD_REPORT_CONTROL_COLUMNS } from './ad-report-button'
 import { useTerminalDimensions } from '../hooks/use-terminal-dimensions'
 import { useTheme } from '../hooks/use-theme'
 import { BORDER_CHARS, INVERTED_CTA_FG } from '../utils/ui-constants'
@@ -66,9 +71,8 @@ export function getCardAdLayout(
   // Every field is defaulted before it is read. `AdResponse` types these as
   // required strings, but nothing enforces that at runtime: the Gravity
   // provider casts `response.json()` rather than parsing it and `normalize()`
-  // copies `cta: raw.cta` with no default, while the Carbon provider beside it
-  // writes `cta: raw.callToAction ?? 'Learn more'` — so a missing field is a
-  // case this codebase already expects from a network. A throw here is a throw
+  // copies `cta: raw.cta` with no default — so a missing field is a case this
+  // codebase already expects from a network. A throw here is a throw
   // inside AdCard's render on the landing screen, and `error-boundary.tsx` is a
   // passthrough that does not catch render errors.
   const title = (ad.title ?? '').trim()
@@ -128,25 +132,74 @@ export const AdCard: React.FC<{
   onClick?: (ad: AdResponse) => void
   onImpression?: (ad: AdResponse) => void
 }> = ({ ad, width, variant = 'card', onClick, onImpression }) => {
-  const theme = useTheme()
+  const baseTheme = useTheme()
+  const brand = greptileTerminalColors(ad)
+  const theme = brand
+    ? { ...baseTheme, foreground: brand.ink, muted: brand.ink, primary: brand.ink }
+    : baseTheme
   const [isHovered, setIsHovered] = useState(false)
 
   useEffect(() => {
     onImpression?.(ad)
   }, [ad, onImpression])
 
+  // Laid out before the early return below, so the engagement hook can judge
+  // truncation from exactly what is drawn.
+  const inlineLayout =
+    variant === 'inline' ? getInlineAdLayout(ad, width) : null
+  if (inlineLayout) {
+    inlineLayout.title = truncateToWidth(
+      inlineLayout.title,
+      Math.max(0, width - 8 - AD_REPORT_CONTROL_COLUMNS),
+    )
+  }
+  const card = variant === 'inline' ? null : getCardAdLayout(ad, width)
+  if (card?.headline) {
+    card.headline = truncateToWidth(
+      card.headline,
+      Math.max(0, width - 8 - AD_REPORT_CONTROL_COLUMNS),
+    )
+  }
+  // An inline card scrolls with the transcript and is measured; the dock and
+  // the landing screen's columns sit outside any scrollbox.
+  const engagement = useAdEngagement(ad.impUrl, {
+    placement: variant === 'inline' ? 'measured' : 'pinned',
+    truncated: inlineLayout
+      ? layoutTruncated([
+          [
+            (ad.title ?? '').trim() ||
+              getAdDisplayLabel({ title: '', url: ad.url ?? '' }).text,
+            inlineLayout.title,
+          ],
+          [ad.adText, inlineLayout.description],
+        ])
+      : card
+        ? layoutTruncated([
+            [ad.title, card.headline],
+            [ad.adText, card.description],
+          ])
+        : undefined,
+  })
+
   const buttonProps = {
-    onClick: () => {
+    ref: engagement.ref,
+    onClick: (event?: unknown) => {
       if (!ad.clickUrl) return
+      engagement.onClick(event)
       onClick?.(ad)
       safeOpen(ad.clickUrl)
     },
-    onMouseOver: () => setIsHovered(true),
-    onMouseOut: () => setIsHovered(false),
+    onMouseOver: () => {
+      setIsHovered(true)
+      engagement.onHover(true)
+    },
+    onMouseOut: () => {
+      setIsHovered(false)
+      engagement.onHover(false)
+    },
   }
 
-  if (variant === 'inline') {
-    const inlineLayout = getInlineAdLayout(ad, width)
+  if (inlineLayout) {
     const accentColor = isHovered ? theme.primary : theme.muted
     return (
       <Button
@@ -154,6 +207,7 @@ export const AdCard: React.FC<{
         style={{
           width,
           height: INLINE_AD_CARD_HEIGHT,
+          backgroundColor: brand?.background,
           borderStyle: 'single',
           borderColor: accentColor,
           customBorderChars: BORDER_CHARS,
@@ -182,9 +236,12 @@ export const AdCard: React.FC<{
           >
             {inlineLayout.title}
           </text>
-          <text style={{ fg: theme.muted, flexShrink: 0, wrapMode: 'none' }}>
-            {INLINE_AD_DISCLOSURE}
-          </text>
+          <box style={{ flexDirection: 'row', flexShrink: 0 }}>
+            <text style={{ fg: theme.muted, wrapMode: 'none' }}>
+              {INLINE_AD_DISCLOSURE}
+            </text>
+            <AdReportButton ad={{ ...ad, surface: 'cli' }} color={theme.muted} />
+          </box>
         </box>
         <box
           style={{
@@ -216,7 +273,7 @@ export const AdCard: React.FC<{
     )
   }
 
-  const card = getCardAdLayout(ad, width)
+  if (!card) return null
 
   return (
     <Button
@@ -224,6 +281,7 @@ export const AdCard: React.FC<{
       style={{
         width,
         height: AD_CARD_HEIGHT,
+        backgroundColor: brand?.background,
         borderStyle: 'single',
         borderColor: isHovered ? theme.primary : theme.muted,
         customBorderChars: BORDER_CHARS,
@@ -254,7 +312,10 @@ export const AdCard: React.FC<{
           >
             {card.headline}
           </text>
-          <text style={{ fg: theme.muted, flexShrink: 0 }}>{'  Ad'}</text>
+          <box style={{ flexDirection: 'row', flexShrink: 0 }}>
+            <text style={{ fg: theme.muted }}>{' Ad'}</text>
+            <AdReportButton ad={{ ...ad, surface: 'cli' }} color={theme.muted} />
+          </box>
         </box>
       ) : null}
       <box
@@ -270,7 +331,10 @@ export const AdCard: React.FC<{
           {card.description}
         </text>
         {card.headline ? null : (
-          <text style={{ fg: theme.muted, flexShrink: 0 }}>{'  Ad'}</text>
+          <box style={{ flexDirection: 'row', flexShrink: 0 }}>
+            <text style={{ fg: theme.muted }}>{' Ad'}</text>
+            <AdReportButton ad={{ ...ad, surface: 'cli' }} color={theme.muted} />
+          </box>
         )}
       </box>
       <box style={{ flexGrow: 1 }} />
@@ -286,7 +350,7 @@ export const AdCard: React.FC<{
       >
         <text
           style={{
-            fg: INVERTED_CTA_FG,
+            fg: brand?.background ?? INVERTED_CTA_FG,
             bg: isHovered ? theme.primary : theme.muted,
             attributes: TextAttributes.BOLD,
           }}
@@ -342,7 +406,11 @@ export const DockAdCard: React.FC<{
   onClick,
   onImpression,
 }) => {
-  const theme = useTheme()
+  const baseTheme = useTheme()
+  const brand = greptileTerminalColors(ad)
+  const theme = brand
+    ? { ...baseTheme, foreground: brand.ink, muted: brand.ink, primary: brand.ink }
+    : baseTheme
   const [isHovered, setIsHovered] = useState(false)
   const [isCtaHovered, setIsCtaHovered] = useState(false)
 
@@ -355,6 +423,27 @@ export const DockAdCard: React.FC<{
     if (layout.mode !== 'dock') return
     onImpression?.(ad)
   }, [ad, onImpression, layout.mode])
+
+  // The narrow fallback renders `AdCard`, which tracks itself.
+  const engagement = useAdEngagement(ad.impUrl, {
+    placement: 'pinned',
+    enabled: layout.mode === 'dock',
+    truncated:
+      layout.mode === 'dock'
+        ? layoutTruncated([
+            [ad.title, layout.headline],
+            [ad.adText, layout.description],
+            [(ad.cta ?? '').trim() || 'Learn more', layout.ctaText],
+          ])
+        : undefined,
+  })
+
+  // Hover is read from the tint state: the children's over/out bubble to the
+  // box and React batches an out-then-over into no change at all.
+  const { onHover: reportHover } = engagement
+  useEffect(() => {
+    reportHover(isHovered)
+  }, [isHovered, reportHover])
 
   if (layout.mode === 'card') {
     // The narrow fallback keeps today's card AND today's click semantics: the
@@ -387,6 +476,7 @@ export const DockAdCard: React.FC<{
       style={{
         width,
         height: AD_CARD_HEIGHT,
+        backgroundColor: brand?.background,
         borderStyle: 'single',
         borderColor: accentColor,
         customBorderChars: BORDER_CHARS,
@@ -439,6 +529,7 @@ export const DockAdCard: React.FC<{
               {layout.chordHint}
             </text>
           ) : null}
+          <AdReportButton ad={{ ...ad, surface: 'cli' }} color={theme.muted} />
         </box>
         {layout.headline ? (
           <text
@@ -458,8 +549,9 @@ export const DockAdCard: React.FC<{
       {/* A SIBLING of the toggle, never a child: the CTA opens the landing
           page and must not also expand the panel. */}
       <Button
-        onClick={() => {
+        onClick={(event?: unknown) => {
           if (!ad.clickUrl) return
+          engagement.onClick(event, 'cta')
           onClick?.(ad, 'dock')
           safeOpen(ad.clickUrl)
         }}
@@ -478,7 +570,7 @@ export const DockAdCard: React.FC<{
       >
         <text
           style={{
-            fg: isCtaHovered ? INVERTED_CTA_FG : theme.primary,
+            fg: isCtaHovered ? brand?.background ?? INVERTED_CTA_FG : theme.primary,
             bg: isCtaHovered ? theme.primary : undefined,
             wrapMode: 'none',
           }}
@@ -508,7 +600,11 @@ export const DockDetailPanel: React.FC<{
   onClose: () => void
   onClick?: (ad: AdResponse, from: DockClickOrigin) => void
 }> = ({ ad, width, availableRows, onClose, onClick }) => {
-  const theme = useTheme()
+  const baseTheme = useTheme()
+  const brand = greptileTerminalColors(ad)
+  const theme = brand
+    ? { ...baseTheme, foreground: brand.ink, muted: brand.ink, primary: brand.ink }
+    : baseTheme
   const [isCtaHovered, setIsCtaHovered] = useState(false)
   const [isCloseHovered, setIsCloseHovered] = useState(false)
 
@@ -517,15 +613,25 @@ export const DockDetailPanel: React.FC<{
     [ad, width, availableRows],
   )
 
+  // A second drawn copy of the dock's impression: hovering or clicking the
+  // panel is engagement with the same ad, on the same record.
+  const engagement = useAdEngagement(ad.impUrl, {
+    placement: 'pinned',
+    enabled: panel.fits,
+  })
+
   if (!panel.fits) return null
 
   const interiorWidth = Math.max(0, panel.width - 4)
 
   return (
     <box
+      onMouseOver={() => engagement.onHover(true)}
+      onMouseOut={() => engagement.onHover(false)}
       style={{
         width: panel.width,
         height: panel.height,
+        backgroundColor: brand?.background,
         borderStyle: 'single',
         borderColor: theme.primary,
         customBorderChars: BORDER_CHARS,
@@ -549,9 +655,12 @@ export const DockDetailPanel: React.FC<{
         >
           {panel.brand}
         </text>
-        <text style={{ fg: theme.primary, flexShrink: 0, wrapMode: 'none' }}>
-          {DOCK_SPONSORED_LABEL}
-        </text>
+        <box style={{ flexDirection: 'row', flexShrink: 0 }}>
+          <text style={{ fg: theme.primary, wrapMode: 'none' }}>
+            {DOCK_SPONSORED_LABEL}
+          </text>
+          <AdReportButton ad={{ ...ad, surface: 'cli' }} color={theme.muted} />
+        </box>
       </box>
       <box style={{ height: 1 }} />
       <text
@@ -595,8 +704,9 @@ export const DockDetailPanel: React.FC<{
       <box style={{ height: 1 }} />
       <box style={{ height: 3, flexDirection: 'row', overflow: 'hidden' }}>
         <Button
-          onClick={() => {
+          onClick={(event?: unknown) => {
             if (!ad.clickUrl) return
+            engagement.onClick(event, 'cta')
             onClick?.(ad, 'panel')
             safeOpen(ad.clickUrl)
           }}
@@ -614,7 +724,7 @@ export const DockDetailPanel: React.FC<{
         >
           <text
             style={{
-              fg: isCtaHovered ? INVERTED_CTA_FG : theme.primary,
+              fg: isCtaHovered ? brand?.background ?? INVERTED_CTA_FG : theme.primary,
               bg: isCtaHovered ? theme.primary : undefined,
               wrapMode: 'none',
             }}

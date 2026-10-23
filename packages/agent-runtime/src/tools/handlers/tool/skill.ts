@@ -1,15 +1,14 @@
 import { SKILLS_DIR_NAME, SKILL_FILE_NAME } from '@codebuff/common/constants/skills'
+import { parseSkillFileContent } from '@codebuff/common/util/parse-skill'
+import type { SkillDefinition } from '@codebuff/common/types/skill'
 import {
-  createSkillDefinition,
-  SkillFrontmatterSchema,
-  type SkillDefinition,
-} from '@codebuff/common/types/skill'
-import { isSkillModelInvocable } from '@codebuff/common/util/skills'
+  formatSkillContent,
+  isSkillModelInvocable,
+} from '@codebuff/common/util/skills'
 import { jsonToolResult } from '@codebuff/common/util/messages'
 import fs from 'fs'
 import path from 'path'
 import os from 'os'
-import matter from 'gray-matter'
 
 import type { CodebuffToolHandlerFunction } from '../handler-function-type'
 import type {
@@ -66,32 +65,16 @@ async function loadSkillFromDisk(
 
       fs.statSync(skillFilePath) // Will throw if file doesn't exist
 
-      // Read and parse the skill file
-      const content = fs.readFileSync(skillFilePath, 'utf8')
-      const parsed = matter(content)
-
-      if (!parsed.data || Object.keys(parsed.data).length === 0) {
-        continue
-      }
-
-      // Validate frontmatter
-      const result = SkillFrontmatterSchema.safeParse(parsed.data)
-      if (!result.success) {
-        continue
-      }
-
-      const frontmatter = result.data
-
-      // Verify name matches directory name
-      if (frontmatter.name !== skillName) {
-        continue
-      }
-
-      return createSkillDefinition({
-        frontmatter,
-        content,
-        filePath: skillFilePath,
-      })
+      // Same parser as session-start discovery, so a skill created mid-session
+      // is held to the same rules (YAML-only frontmatter, name matches dir).
+      const skill = parseSkillFileContent(
+        fs.readFileSync(skillFilePath, 'utf8'),
+        {
+          directoryName: skillName,
+          filePath: skillFilePath,
+        },
+      )
+      if (skill) return skill
     } catch {
       // Skill doesn't exist in this directory, try the next one
       continue
@@ -155,7 +138,7 @@ export const handleSkill = (async (params: {
   const result: { name: string; description: string; content: string; license?: string } = {
     name: skill.name,
     description: skill.description,
-    content: skill.content,
+    content: formatSkillContent(skill),
   }
   if (skill.license) {
     result.license = skill.license

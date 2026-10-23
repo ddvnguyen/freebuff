@@ -3,9 +3,9 @@
  *
  * macOS has served paid generic offers since COD-568 with no switch of its
  * own. Every other Desktop OS reaches the same paid path only behind ONE
- * switch per OS, with exactly the same rules as macOS once it is on (Owen,
- * 2026-09-24: every agentic campaign follows the same rules on every OS, with
- * no special paths and no per-campaign lists):
+ * switch per OS, with exactly the same rules as macOS once it is on
+ * (2026-09-24: every agentic campaign follows the same rules on every OS,
+ * with no special paths and no per-campaign lists):
  *
  * - Windows (COD-642): `FREEBUFF_SPONSORED_WINDOWS`, surface `desktop_windows`,
  *   contained by the portable floor (`./sponsored-windows`).
@@ -40,8 +40,6 @@ export const SPONSORED_OS_SWITCHES = {
 
 /** A Desktop OS whose paid agentic serving sits behind its own switch. */
 export type SponsoredSwitchedOs = keyof typeof SPONSORED_OS_SWITCHES
-export type SponsoredSwitchedOsSurface =
-  (typeof SPONSORED_OS_SWITCHES)[SponsoredSwitchedOs]['surface']
 
 /** The env vars the switches are read from. */
 export type SponsoredOsSwitchEnv = {

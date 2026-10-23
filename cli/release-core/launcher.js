@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const { spawn } = require('child_process')
+const { execFileSync, spawn } = require('child_process')
 const crypto = require('crypto')
 const fs = require('fs')
 const http = require('http')
@@ -36,14 +36,50 @@ const PLATFORM_TARGET_KEYS = [
 const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]'])
 
 /**
+ * Registrable domains that serve release downloads. An https override must
+ * name one of these or a subdomain of one.
+ */
+const RELEASE_ORIGIN_DOMAINS = ['codebuff.com', 'freebuff.com']
+
+function isReleaseOriginHost(hostname) {
+  const host = hostname.toLowerCase()
+  return RELEASE_ORIGIN_DOMAINS.some(
+    (domain) => host === domain || host.endsWith(`.${domain}`),
+  )
+}
+
+/**
+ * A release version the launcher will put into a download URL or a file
+ * name: strict `MAJOR.MINOR.PATCH` with an optional dot-separated
+ * alphanumeric prerelease, and nothing else — no build metadata, no
+ * leading `v`, no whitespace, `/`, `..`, `%` or `?`. The version reaches
+ * `/api/releases/download/<version>/<file>` and the partial-archive path
+ * from the npm registry document or the local metadata file, and neither
+ * is a place that should be able to rewrite a URL path or escape a
+ * directory.
+ */
+const STRICT_RELEASE_VERSION =
+  /^(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})(?:-(?:0|[1-9]\d{0,8}|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d{0,8}|\d*[A-Za-z-][0-9A-Za-z-]*))*)?$/
+
+function isStrictReleaseVersion(version) {
+  return (
+    typeof version === 'string' &&
+    version.length <= 64 &&
+    STRICT_RELEASE_VERSION.test(version)
+  )
+}
+
+/**
  * Decide where release archives are downloaded from.
  *
  * NEXT_PUBLIC_CODEBUFF_APP_URL is read at runtime, so anyone able to set an
- * environment variable could point the launcher at a plain-http origin and
- * let a network attacker substitute the archive. The override is honoured
- * only over https, or over http on a loopback host (local release servers in
- * development and tests). Anything else is ignored with a warning and the
- * default origin is used.
+ * environment variable could point the launcher at another origin. The
+ * archive's sha256 comes from npm, not from that origin, so a substituted
+ * archive is refused either way; the origin is still held to the hosts that
+ * actually serve releases. The override is honoured only over https to a
+ * codebuff.com / freebuff.com host, or over http/https on a loopback host
+ * (local release servers in development and tests). Anything else is
+ * ignored with a warning and the default origin is used.
  */
 function resolveDownloadOrigin(configuredOrigin, { warn = () => {} } = {}) {
   if (typeof configuredOrigin !== 'string' || configuredOrigin.trim() === '') {
@@ -62,15 +98,25 @@ function resolveDownloadOrigin(configuredOrigin, { warn = () => {} } = {}) {
   }
 
   const isLocal = LOCAL_HOSTNAMES.has(parsed.hostname.toLowerCase())
+  const isHttp = parsed.protocol === 'http:' || parsed.protocol === 'https:'
+  // Only an origin: credentials or a query would ride along on every request.
+  const isBareOrigin =
+    !parsed.username && !parsed.password && !parsed.search && !parsed.hash
+  if (isHttp && isLocal && isBareOrigin) {
+    return trimmed
+  }
   if (
-    parsed.protocol === 'https:' ||
-    (parsed.protocol === 'http:' && isLocal)
+    parsed.protocol === 'https:' &&
+    isReleaseOriginHost(parsed.hostname) &&
+    isBareOrigin
   ) {
     return trimmed
   }
 
   warn(
-    `Ignoring NEXT_PUBLIC_CODEBUFF_APP_URL=${configuredOrigin}: release downloads must use https (http is allowed only for localhost). Downloading from ${DEFAULT_DOWNLOAD_ORIGIN}.`,
+    parsed.protocol === 'https:'
+      ? `Ignoring NEXT_PUBLIC_CODEBUFF_APP_URL=${parsed.protocol}//${parsed.host}: release downloads come only from codebuff.com or freebuff.com (or localhost). Downloading from ${DEFAULT_DOWNLOAD_ORIGIN}.`
+      : `Ignoring NEXT_PUBLIC_CODEBUFF_APP_URL=${parsed.protocol}//${parsed.host}: release downloads must use https (http is allowed only for localhost). Downloading from ${DEFAULT_DOWNLOAD_ORIGIN}.`,
   )
   return DEFAULT_DOWNLOAD_ORIGIN
 }
@@ -139,10 +185,16 @@ function createLauncher(productConfig) {
     startupBanner = [],
     telemetryEvent = 'cli.update_codebuff_failed',
     telemetryProperties = {},
+    // Freebuff sessions remain open between turns. The launcher cannot know
+    // when a restart is safe, so keep the process alive until the user exits.
+    deferUpdatesUntilExit = false,
     tempDownloadDirName = `.${packageName}-download-temp`,
     // Tests only. os.homedir() ignores $HOME under `bun test`, so pointing HOME
     // at a temp dir is not enough to keep a test off the real ~/.config.
     configDir: configDirOverride = null,
+    // Tests only: stands in for the OS AVX2 probe (/proc/cpuinfo, sysctl),
+    // returning true, false, or null for "could not tell".
+    cpuAvx2Probe: cpuAvx2ProbeOverride = null,
   } = productConfig
 
   /**
@@ -254,6 +306,52 @@ function createLauncher(productConfig) {
     )
   }
 
+  /**
+   * Bun's own crash report saying this CPU cannot run the optimized build.
+   *
+   * On Windows the exit code does not carry that. Bun's crash handler catches
+   * EXCEPTION_ILLEGAL_INSTRUCTION itself, prints a report, then leaves through
+   * Zig's std.posix.abort(), which on Windows is ExitProcess(3). So an AVX2
+   * build on a CPU without AVX2 exits with plain code 3, neither
+   * 0xC000001D nor 0xC0000409, and both checks above miss it. The Sept 27
+   * report (i3-2100, Bun 1.3.14) is exactly this:
+   *
+   *   CPU: sse42 avx
+   *   Features: no_avx2
+   *   panic: Illegal instruction at address 0x7FF61902F82C
+   *   panicked during a panic. Aborting.
+   *
+   * The report is in the stderr tail watchLaunch() keeps on Windows. Either line
+   * is proof, not a guess. `Features: no_avx2` is Bun's own CPUID answer, and a
+   * Bun "Illegal instruction" panic is the same Windows exception
+   * 0xC000001D reports, intercepted before it became the exit code. Only Bun's
+   * exact formats count, so ordinary output that mentions them does not.
+   */
+  const BUN_NO_AVX2_FEATURE = /^Features:[^\n]*\bno_avx2\b/m
+  const BUN_ILLEGAL_INSTRUCTION_PANIC =
+    /^panic(?:\([^)\n]*\))?: Illegal instruction at address 0x[0-9a-f]+/im
+
+  /**
+   * Bun's `CPU:` header line lists the features it detected (`CPU: sse42
+   * popcnt avx avx2`). avx2 in that list is Bun's own CPUID saying the CPU has
+   * it, so an illegal instruction on such a machine is not a missing AVX2.
+   */
+  const BUN_CPU_LINE = /^CPU:([^\n]*)$/m
+
+  function stderrReportsAvx2Present(stderrTail) {
+    if (!stderrTail) return false
+    const match = BUN_CPU_LINE.exec(sanitizeForReplay(stderrTail))
+    return Boolean(match && /(?:^|\s)avx2(?:\s|$)/i.test(match[1]))
+  }
+
+  function stderrReportsMissingCpuFeature(code, signal, stderrTail) {
+    if (!stderrTail || (code === 0 && !signal)) return false
+    const text = sanitizeForReplay(stderrTail)
+    return (
+      BUN_NO_AVX2_FEATURE.test(text) || BUN_ILLEGAL_INSTRUCTION_PANIC.test(text)
+    )
+  }
+
   function createConfig(packageName) {
     const homeDir = os.homedir()
     const configDir =
@@ -267,7 +365,14 @@ function createLauncher(productConfig) {
       binaryName,
       binaryPath: path.join(configDir, binaryName),
       metadataPath: path.join(configDir, `${packageName}-metadata.json`),
-      tempDownloadDir: path.join(configDir, tempDownloadDirName),
+      // A deferred download may wait here for an hour. Another invocation
+      // must not replace its staged binary (or delete it while downloading).
+      tempDownloadDir: path.join(
+        configDir,
+        deferUpdatesUntilExit
+          ? `${tempDownloadDirName}-${process.pid}`
+          : tempDownloadDirName,
+      ),
       userAgent: `${packageName}-cli`,
       requestTimeout: 20000,
       downloadRequestTimeout: 120000,
@@ -276,6 +381,7 @@ function createLauncher(productConfig) {
   }
 
   const CONFIG = createConfig(packageName)
+  const pendingUpdates = new WeakMap()
   const { downloadFile, httpGet, withRetries } = createReleaseHttpClient({
     env: process.env,
     userAgent: CONFIG.userAgent,
@@ -398,12 +504,75 @@ function createLauncher(productConfig) {
     return null
   }
 
-  function linuxCpuHasAvx2() {
-    try {
-      return /\bavx2\b/i.test(fs.readFileSync('/proc/cpuinfo', 'utf8'))
-    } catch {
-      return true
+  /**
+   * `/proc/cpuinfo` answers for the kernel's view of the CPU: true or false
+   * from its `flags` lines, null when it has none to read.
+   */
+  function parseCpuinfoAvx2(text) {
+    if (typeof text !== 'string' || !/^flags\s*:/m.test(text)) return null
+    return /^flags\s*:.*\bavx2\b/m.test(text)
+  }
+
+  /** `sysctl -n hw.optional.avx2_0` prints 1 or 0 on an Intel Mac. */
+  function parseSysctlAvx2(output) {
+    const value = typeof output === 'string' ? output.trim() : ''
+    if (value === '1') return true
+    if (value === '0') return false
+    return null
+  }
+
+  // Where probeCpuAvx2() gets its answer, recorded as the evidence for a pin.
+  function cpuProbeSource() {
+    if (process.platform === 'linux') return 'cpuinfo'
+    if (process.platform === 'darwin') return 'sysctl'
+    return 'probe'
+  }
+
+  let _cpuProbeCache
+
+  /**
+   * Ask the OS whether this CPU has AVX2: true, false, or null for "could not
+   * tell". Linux reads /proc/cpuinfo. macOS asks sysctl, which costs a
+   * subprocess, so this runs only on the crash path, when re-checking an old
+   * pin, and when picking a download target for a baseline install, never on
+   * an ordinary launch. Windows has no probe: the one we had tripped Defender
+   * (see detectMachineHasAvx2), so there Bun's crash report is the evidence.
+   */
+  function probeCpuAvx2() {
+    if (_cpuProbeCache === undefined) {
+      _cpuProbeCache = cpuAvx2ProbeOverride
+        ? cpuAvx2ProbeOverride()
+        : probeCpuAvx2FromOs()
     }
+    return _cpuProbeCache
+  }
+
+  function probeCpuAvx2FromOs() {
+    if (process.arch !== 'x64') return null
+    if (process.platform === 'linux') {
+      try {
+        return parseCpuinfoAvx2(fs.readFileSync('/proc/cpuinfo', 'utf8'))
+      } catch {
+        return null
+      }
+    }
+    if (process.platform === 'darwin') {
+      // x64 node on Apple Silicon runs under Rosetta, and sysctl (arm64 only)
+      // then describes the host, not what Rosetta emulates. No answer there.
+      if (/\bApple\b/.test(os.cpus()[0]?.model || '')) return null
+      try {
+        return parseSysctlAvx2(
+          execFileSync('/usr/sbin/sysctl', ['-n', 'hw.optional.avx2_0'], {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+            timeout: 2000,
+          }),
+        )
+      } catch {
+        return null
+      }
+    }
+    return null
   }
 
   let _hasAvx2Cache
@@ -420,17 +589,33 @@ function createLauncher(productConfig) {
       return true
     }
 
-    // A recorded illegal-instruction crash outranks everything below it: the
-    // binary actually failed on this machine, which beats any inference we
-    // could make about the CPU.
-    const recorded = readCachedAvx2()
-    if (recorded !== null) {
-      return recorded
+    // A recorded verdict outranks everything below it. Every record now names
+    // its evidence: Bun's crash report, the OS probe, or 'crash' for an
+    // illegal instruction nothing could explain.
+    //
+    // A record WITHOUT evidence was written by an older launcher, which pinned
+    // baseline on any SIGILL, including a bug on a CPU that has AVX2. Re-check
+    // those against the OS once: a CPU with AVX2 gets its record dropped and
+    // the optimized build back on the next update (see getDownloadTargetKey).
+    const record = readCpuFeatureRecord()
+    if (record && (record.avx2 || record.evidence)) {
+      return record.avx2
+    }
+    if (record) {
+      const probed = probeCpuAvx2()
+      if (probed !== true) {
+        writeCpuFeatureRecord(
+          false,
+          probed === false ? cpuProbeSource() : 'crash',
+        )
+        return false
+      }
+      clearCpuFeatureRecord()
     }
 
     // Linux can just ask, and a file read is cheap enough not to cache.
     if (process.platform === 'linux') {
-      return linuxCpuHasAvx2()
+      return probeCpuAvx2() ?? true
     }
 
     // Everything else assumes AVX2 — true of every x64 CPU since ~2013.
@@ -448,39 +633,74 @@ function createLauncher(productConfig) {
     return true
   }
 
-  // Called from the illegal-instruction fallback. Persisting here is what keeps
-  // the optimistic assumption above from costing more than a single crash — and
-  // it is deliberately separate from the metadata target, so a lost or rewritten
-  // metadata file can't resurrect the AVX2 build on a CPU that can't run it.
-  function recordMachineLacksAvx2() {
+  /**
+   * Positive evidence that this CPU runs the optimized build: a recorded
+   * verdict with evidence, or the OS probe. The optimistic default does not
+   * count. This is what lets a baseline install move back to the optimized
+   * build; without evidence, baseline stays put.
+   */
+  function knownToHaveAvx2() {
+    if (!machineHasAvx2()) return false
+    const record = readCpuFeatureRecord()
+    if (record?.avx2 === true && record.evidence) return true
+    return probeCpuAvx2() === true
+  }
+
+  // Called from the illegal-instruction fallback, only when the CPU is shown
+  // to lack AVX2 or nothing can say either way (see tryFallbackToBaseline).
+  // Persisting here is what keeps the optimistic assumption above from costing
+  // more than a single crash — and it is deliberately separate from the
+  // metadata target, so a lost or rewritten metadata file can't resurrect the
+  // AVX2 build on a CPU that can't run it.
+  function recordMachineLacksAvx2(evidence = 'crash') {
     _hasAvx2Cache = false
-    writeCachedAvx2(false)
+    writeCpuFeatureRecord(false, evidence)
   }
 
   function getCpuFeatureCachePath() {
     return path.join(CONFIG.configDir, 'cpu-features.json')
   }
 
-  function readCachedAvx2() {
+  /** `{ avx2, evidence }`; evidence is null on a record from an older launcher. */
+  function readCpuFeatureRecord() {
     try {
       const cache = JSON.parse(
         fs.readFileSync(getCpuFeatureCachePath(), 'utf8'),
       )
-      return typeof cache.avx2 === 'boolean' ? cache.avx2 : null
+      if (typeof cache.avx2 !== 'boolean') return null
+      return {
+        avx2: cache.avx2,
+        evidence:
+          typeof cache.evidence === 'string' && cache.evidence
+            ? cache.evidence
+            : null,
+      }
     } catch {
       return null
     }
   }
 
-  function writeCachedAvx2(value) {
+  function readCachedAvx2() {
+    return readCpuFeatureRecord()?.avx2 ?? null
+  }
+
+  function writeCpuFeatureRecord(value, evidence) {
     try {
       fs.mkdirSync(CONFIG.configDir, { recursive: true })
       fs.writeFileSync(
         getCpuFeatureCachePath(),
-        JSON.stringify({ avx2: value }),
+        JSON.stringify({ avx2: value, evidence }),
       )
     } catch {
       // Best effort; we'll just re-probe next launch.
+    }
+  }
+
+  function clearCpuFeatureRecord() {
+    try {
+      fs.unlinkSync(getCpuFeatureCachePath())
+    } catch {
+      // Already gone, or unwritable; either way nothing pins baseline now.
     }
   }
 
@@ -536,6 +756,17 @@ function createLauncher(productConfig) {
 
     const metadata = getCurrentMetadata()
     if (metadata?.target && isTargetAllowedForThisMachine(metadata.target)) {
+      // An installed baseline keeps running (isTargetAllowedForThisMachine
+      // always allows it), but it is not a life sentence: once there is
+      // evidence the CPU has AVX2, the next download goes back to the optimized
+      // build. That is how a machine sent to baseline by a crash that was not a
+      // missing AVX2 re-probes on the next version.
+      if (
+        metadata.target === getBaselineFallbackTargetKey() &&
+        knownToHaveAvx2()
+      ) {
+        return getDefaultTargetKey()
+      }
       return metadata.target
     }
 
@@ -562,7 +793,7 @@ function createLauncher(productConfig) {
 
       const body = await streamToString(res)
       const packageData = JSON.parse(body)
-      if (typeof packageData.version !== 'string' || !packageData.version) {
+      if (!isStrictReleaseVersion(packageData.version)) {
         return null
       }
 
@@ -751,6 +982,9 @@ function createLauncher(productConfig) {
   }
 
   function getPartialArchivePath(version, targetKey) {
+    if (!isStrictReleaseVersion(version)) {
+      throw new Error(`Invalid release version for an archive path: ${version}`)
+    }
     return path.join(
       CONFIG.configDir,
       `.${packageName}-${version}-${targetKey}.tar.gz.part`,
@@ -983,6 +1217,21 @@ function createLauncher(productConfig) {
   ) {
     const fileName = PLATFORM_TARGETS[targetKey]
 
+    // Before anything is built from it: the version becomes a URL path
+    // segment and part of a file name below.
+    if (!isStrictReleaseVersion(version)) {
+      const error = new Error(
+        `Refusing to download ${packageName}: ${JSON.stringify(String(version)).slice(0, 80)} is not a release version.`,
+      )
+      error.code = 'EBADVERSION'
+      error.retryable = false
+      trackUpdateFailed(error.message, 'invalid', {
+        stage: 'version_check',
+        target: targetKey,
+      })
+      throw error
+    }
+
     if (!fileName) {
       const error = new Error(
         `Unsupported platform: ${process.platform} ${process.arch}`,
@@ -1085,9 +1334,19 @@ function createLauncher(productConfig) {
     }
   }
 
-  function installStagedBinary({ tempBinaryPath, version, targetKey }) {
+  function installStagedBinary(
+    { tempBinaryPath, version, targetKey },
+    // keepStagingOnFailure: leave a staged update that could not be moved
+    // into place (a file locked by antivirus or another session on Windows)
+    // for the next launch to adopt, instead of downloading it all again.
+    { quiet = false, keepStagingOnFailure = false } = {},
+  ) {
     const replacements = []
+    let installed = false
     const metadataTempPath = `${CONFIG.metadataPath}.new.${process.pid}`
+    // The directory the binary was staged in: this launcher's own, or one
+    // adopted from a launcher that died before it could install it.
+    const stagingDir = path.dirname(tempBinaryPath)
 
     try {
       fs.writeFileSync(
@@ -1104,10 +1363,7 @@ function createLauncher(productConfig) {
       // pre-date this change won't have the wasm and will still install —
       // they'll just hit the same crash they had before, which is fine.
       if (includeTreeSitterWasm) {
-        const tempWasmPath = path.join(
-          CONFIG.tempDownloadDir,
-          'tree-sitter.wasm',
-        )
+        const tempWasmPath = path.join(stagingDir, 'tree-sitter.wasm')
         if (fs.existsSync(tempWasmPath)) {
           const targetWasmPath = path.join(
             path.dirname(CONFIG.binaryPath),
@@ -1123,18 +1379,21 @@ function createLauncher(productConfig) {
         replacements,
       )
       commitReplacements(replacements)
+      installed = true
     } catch (error) {
       rollbackReplacements(replacements)
       throw error
     } finally {
       removeFileIfPresent(metadataTempPath)
-      if (fs.existsSync(CONFIG.tempDownloadDir)) {
-        fs.rmSync(CONFIG.tempDownloadDir, { recursive: true })
+      if ((installed || !keepStagingOnFailure) && fs.existsSync(stagingDir)) {
+        fs.rmSync(stagingDir, { recursive: true })
       }
     }
 
-    term.clearLine()
-    console.log(`Download complete! Starting ${displayName}...`)
+    if (!quiet) {
+      term.clearLine()
+      console.log(`Download complete! Starting ${displayName}...`)
+    }
   }
 
   async function downloadBinary(
@@ -1240,7 +1499,11 @@ function createLauncher(productConfig) {
     })
   }
 
-  async function checkForUpdates(runningProcess, exitListener) {
+  async function checkForUpdates(
+    runningProcess,
+    exitListener,
+    fetchLatestRelease = getLatestRelease,
+  ) {
     // main() schedules this 100ms after launch, so the binary it was handed can
     // already be dead — a startup crash that handed off to the baseline
     // fallback, most of all. Updating around a corpse would race that
@@ -1259,9 +1522,14 @@ function createLauncher(productConfig) {
     try {
       const currentVersion = getCurrentVersion()
 
-      const latestRelease = await getLatestRelease()
+      const latestRelease = await fetchLatestRelease()
       const latestVersion = latestRelease?.version ?? null
       if (!latestVersion) return
+      if (
+        runningProcess.exitCode !== null ||
+        runningProcess.signalCode !== null
+      )
+        return
 
       if (
         // Download new version if current version is unknown or outdated.
@@ -1273,6 +1541,26 @@ function createLauncher(productConfig) {
           getDownloadTargetKey(),
           { quiet: true, binaryChecksums: latestRelease.binaryChecksums },
         )
+
+        if (deferUpdatesUntilExit) {
+          // No signals, terminal output, or binary/WASM replacement while the
+          // CLI owns the session. Even an idle model picker can admit a session
+          // while the download is in flight. A download that loses the race
+          // with exit must not install into a fallback child's running files.
+          if (
+            runningProcess.exitCode === null &&
+            runningProcess.signalCode === null
+          ) {
+            pendingUpdates.set(runningProcess, stagedBinary)
+            // Closing the terminal window kills this launcher too (SIGHUP, or
+            // CTRL_CLOSE_EVENT on Windows) before the exit handler can
+            // install. Mark the staged update ready so the next launch adopts
+            // it instead of a user who never quits from inside the CLI
+            // staying on this build forever.
+            await writeStagedManifest(stagedBinary)
+          }
+          return
+        }
 
         term.clearLine()
 
@@ -1313,6 +1601,229 @@ function createLauncher(productConfig) {
     }
   }
 
+  function installPendingUpdate(child) {
+    const staged = pendingUpdates.get(child)
+    pendingUpdates.delete(child)
+    if (!staged) return
+
+    try {
+      // A second launcher may have installed a newer release while this
+      // session was open. Never roll its installation back on our exit.
+      const currentVersion = getCurrentVersion()
+      if (
+        currentVersion &&
+        compareVersions(currentVersion, staged.version) >= 0
+      ) {
+        fs.rmSync(CONFIG.tempDownloadDir, { recursive: true, force: true })
+        return
+      }
+      installStagedBinary(staged, { quiet: true, keepStagingOnFailure: true })
+      console.log(
+        `Updated ${displayName} to ${staged.version}. Ready for your next launch.`,
+      )
+    } catch (error) {
+      // Installation rolls back on failure. Updating must not change the
+      // user's exit code or resurrect a CLI they just closed.
+      console.error(`Could not install ${displayName} update: ${error.message}`)
+    }
+  }
+
+  /**
+   * Deferred staging directories are `<tempDownloadDirName>-<pid>`, plus
+   * `<…>-<pid>.adopting` while a later launcher installs one it adopted. The
+   * pid is the launcher that owns the directory.
+   */
+  const STAGED_MANIFEST_NAME = 'staged.json'
+
+  function parseStagingDirOwner(name) {
+    const prefix = `${tempDownloadDirName}-`
+    if (!name.startsWith(prefix)) return null
+    const match = /^(\d{1,10})(?:\.adopting)?$/.exec(name.slice(prefix.length))
+    return match ? Number(match[1]) : null
+  }
+
+  function isProcessAlive(pid) {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (error) {
+      // EPERM: it exists, it just is not ours to signal.
+      return error?.code === 'EPERM'
+    }
+  }
+
+  /**
+   * Record that a staged update is complete: the version, target and sha256 of
+   * every file installStagedBinary() will move. Written last and renamed into
+   * place, so a launcher killed mid-download or mid-extraction leaves a
+   * directory without one, which is only ever deleted. Best effort: a failure
+   * here leaves the exit-time install exactly as it was.
+   *
+   * The hashes are this launcher's own record, checked again before adoption
+   * so a file truncated or altered on disk since is never installed. They are
+   * not a second trust root: the archive was verified against npm's sha256 at
+   * download, and anything able to write this directory can already write the
+   * installed binary next to it.
+   */
+  async function writeStagedManifest({ tempBinaryPath, version, targetKey }) {
+    const stagingDir = path.dirname(tempBinaryPath)
+    const manifestPath = path.join(stagingDir, STAGED_MANIFEST_NAME)
+    const tempManifestPath = `${manifestPath}.tmp`
+    try {
+      const files = {
+        [CONFIG.binaryName]: await computeFileSha256(tempBinaryPath),
+      }
+      const wasmPath = path.join(stagingDir, 'tree-sitter.wasm')
+      if (includeTreeSitterWasm && fs.existsSync(wasmPath)) {
+        files['tree-sitter.wasm'] = await computeFileSha256(wasmPath)
+      }
+      fs.writeFileSync(
+        tempManifestPath,
+        JSON.stringify({ version, target: targetKey, files }),
+      )
+      fs.renameSync(tempManifestPath, manifestPath)
+    } catch {
+      try {
+        removeFileIfPresent(tempManifestPath)
+      } catch {
+        // The directory may already be gone: installed at exit, or removed.
+      }
+    }
+  }
+
+  function readStagedManifest(stagingDir) {
+    try {
+      const manifest = JSON.parse(
+        fs.readFileSync(path.join(stagingDir, STAGED_MANIFEST_NAME), 'utf8'),
+      )
+      const files = manifest?.files
+      if (
+        !isStrictReleaseVersion(manifest?.version) ||
+        !PLATFORM_TARGETS[manifest?.target] ||
+        !files ||
+        typeof files !== 'object' ||
+        !isSha256Hex(files[CONFIG.binaryName]) ||
+        Object.entries(files).some(
+          ([name, digest]) =>
+            !isAllowedArchiveEntry(name, null) || !isSha256Hex(digest),
+        )
+      ) {
+        return null
+      }
+      return { version: manifest.version, targetKey: manifest.target, files }
+    } catch {
+      return null
+    }
+  }
+
+  async function stagedFilesMatch(stagingDir, files) {
+    for (const [name, digest] of Object.entries(files)) {
+      const filePath = path.join(stagingDir, name)
+      if (!fs.existsSync(filePath)) return false
+      const verification = await verifyFileSha256(filePath, digest)
+      if (!verification.ok) return false
+    }
+    // Nothing unlisted may ride along into the install (the wasm is moved
+    // whenever it is present).
+    return fs
+      .readdirSync(stagingDir)
+      .every((name) => name === STAGED_MANIFEST_NAME || name in files)
+  }
+
+  /**
+   * Install an update a previous launcher downloaded but never installed, and
+   * delete what dead launchers left behind.
+   *
+   * A deferred update is installed by the launcher's exit handler, which runs
+   * only when the CLI exits on its own. Closing the terminal window or tab
+   * (SIGHUP; CTRL_CLOSE_EVENT on Windows) kills the launcher first, so a user
+   * who always leaves that way never updated: each launch downloaded the same
+   * release again and left another full copy of the binary in a
+   * `<tempDownloadDirName>-<pid>` directory.
+   *
+   * Runs before the binary starts, so nothing of ours holds the files. A
+   * directory whose owner is still running belongs to a live session that
+   * will install it on exit and is left alone. Claiming by rename means two
+   * launchers starting together never install the same directory twice.
+   * Never throws: a failure here must not stop the CLI from starting.
+   */
+  function removeDirQuietly(dir) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true })
+    } catch {
+      // Locked (Windows) or already gone; the next launch tries again.
+    }
+  }
+
+  async function adoptOrphanedStagedUpdates() {
+    if (!deferUpdatesUntilExit) return null
+    try {
+      const orphans = []
+      for (const name of fs.readdirSync(CONFIG.configDir)) {
+        const owner = parseStagingDirOwner(name)
+        if (owner === null) continue
+        // Our own pid was just assigned to us, so a directory under it is a
+        // leftover from an earlier process that had the same pid.
+        if (owner !== process.pid && isProcessAlive(owner)) continue
+        const dir = path.join(CONFIG.configDir, name)
+        orphans.push({ dir, staged: readStagedManifest(dir) })
+      }
+      if (orphans.length === 0) return null
+
+      orphans.sort((a, b) =>
+        a.staged && b.staged
+          ? compareVersions(b.staged.version, a.staged.version)
+          : a.staged
+            ? -1
+            : b.staged
+              ? 1
+              : 0,
+      )
+
+      const installedVersion = getCurrentVersion()
+      let adoptedVersion = null
+      for (const { dir, staged } of orphans) {
+        if (
+          adoptedVersion === null &&
+          staged &&
+          (installedVersion === null ||
+            compareVersions(installedVersion, staged.version) < 0) &&
+          isTargetAllowedForThisMachine(staged.targetKey)
+        ) {
+          const claimedDir = `${CONFIG.tempDownloadDir}.adopting`
+          try {
+            fs.renameSync(dir, claimedDir)
+          } catch {
+            continue // Another launcher claimed it first.
+          }
+          try {
+            if (await stagedFilesMatch(claimedDir, staged.files)) {
+              installStagedBinary(
+                {
+                  tempBinaryPath: path.join(claimedDir, CONFIG.binaryName),
+                  version: staged.version,
+                  targetKey: staged.targetKey,
+                },
+                { quiet: true, keepStagingOnFailure: true },
+              )
+              adoptedVersion = staged.version
+            } else {
+              removeDirQuietly(claimedDir)
+            }
+          } catch {
+            // Rolled back by installStagedBinary, which kept the directory.
+            // It is ours until we exit, then any later launch retries it.
+          }
+          continue
+        }
+        removeDirQuietly(dir)
+      }
+      return adoptedVersion
+    } catch {
+      return null
+    }
+  }
+
   /**
    * Make captured output safe to print back to the terminal.
    *
@@ -1341,7 +1852,9 @@ function createLauncher(productConfig) {
     const { msAlive = null, stderrTail = '' } = context
     // Windows NTSTATUS codes (unsigned DWORD)
     const unsignedCode = getUnsignedExitCode(code)
-    const isIllegalInstruction = isIllegalInstructionExit(code, signal)
+    const isIllegalInstruction =
+      isIllegalInstructionExit(code, signal) ||
+      stderrReportsMissingCpuFeature(code, signal, stderrTail)
     const isAccessViolation =
       signal === 'SIGSEGV' ||
       (process.platform === 'win32' && unsignedCode === 0xc0000005)
@@ -1364,7 +1877,15 @@ function createLauncher(productConfig) {
       )
       console.error('This typically affects CPUs from before 2013.')
       console.error('')
-      printBaselineOverrideHint()
+      if (getCurrentMetadata()?.target === getBaselineFallbackTargetKey()) {
+        console.error(
+          'This is already the older-CPU (baseline) build — please include the',
+        )
+        console.error('output below in your report.')
+        console.error('')
+      } else {
+        printBaselineOverrideHint()
+      }
     } else if (isAccessViolation) {
       console.error('The binary crashed with an access violation.')
       console.error('')
@@ -1532,6 +2053,12 @@ function createLauncher(productConfig) {
           ...process.env,
           ...optionEnv,
           CODEBUFF_LAUNCHER_PID: String(process.pid),
+          // Which npm wrapper started this binary. The wrapper never updates
+          // itself, so this is how launch telemetry tells an install that
+          // cannot install deferred updates from one that can.
+          ...(wrapperVersion
+            ? { CODEBUFF_LAUNCHER_VERSION: String(wrapperVersion) }
+            : {}),
         },
       })
     } catch (err) {
@@ -1599,11 +2126,15 @@ function createLauncher(productConfig) {
     }
   }
 
-  async function tryFallbackToBaseline(code, signal, msAlive) {
-    // Two spellings of one failure, at two levels of certainty. SIGILL /
-    // STATUS_ILLEGAL_INSTRUCTION is proof this CPU cannot run this build; a
-    // Windows startup abort is a strong suspicion (see isStartupCpuFeatureCrash).
-    const confirmed = isIllegalInstructionExit(code, signal)
+  async function tryFallbackToBaseline(code, signal, msAlive, stderrTail = '') {
+    // Three spellings of one failure, at two levels of certainty. SIGILL /
+    // STATUS_ILLEGAL_INSTRUCTION, or Bun's crash report naming the missing
+    // feature (see stderrReportsMissingCpuFeature), is proof this CPU cannot
+    // run this build; a Windows startup abort is a strong suspicion (see
+    // isStartupCpuFeatureCrash).
+    let confirmed =
+      isIllegalInstructionExit(code, signal) ||
+      stderrReportsMissingCpuFeature(code, signal, stderrTail)
     if (!confirmed && !isStartupCpuFeatureCrash(code, signal, msAlive)) {
       return false
     }
@@ -1624,16 +2155,35 @@ function createLauncher(productConfig) {
       return false
     }
 
-    // Only a confirmed illegal instruction gets written down. Persisting it
-    // before the download is what caps the cost at one crash: even if the
-    // download or the relaunch fails, we never optimistically pick the AVX2
-    // build again. A suspected crash records nothing — installing the baseline
-    // already keeps this machine on it, so a guess that turns out to be wrong
-    // costs the slower build instead of leaving cpu-features.json asserting a
-    // CPU limitation we never observed.
-    if (confirmed) {
-      recordMachineLacksAvx2()
+    // An illegal instruction proves the binary used an instruction this
+    // machine refused, not that the instruction was AVX2: a Bun or JIT bug
+    // raises SIGILL too. So ask for evidence before pinning baseline, which
+    // otherwise sticks for good.
+    //
+    // - The CPU lacks AVX2 (Bun's `Features: no_avx2`, or the OS probe):
+    //   record it. Persisting before the download is what caps the cost at
+    //   one crash: even if the download or the relaunch fails, we never
+    //   optimistically pick the AVX2 build again.
+    // - The CPU has AVX2 (the OS probe, or avx2 in Bun's `CPU:` line): this
+    //   crash is something else. Run baseline for now, since it may still
+    //   start, and record the evidence so the next update goes back to the
+    //   optimized build (getDownloadTargetKey). At worst one crash per release.
+    // - No evidence either way (Windows without Bun's report, an unreadable
+    //   /proc/cpuinfo, Rosetta): a confirmed crash is pinned as before.
+    // A suspected crash records nothing: installing the baseline already keeps
+    // this machine on it, and cpu-features.json should not assert a CPU
+    // limitation we never observed.
+    const verdict = crashAvx2Verdict(code, signal, stderrTail)
+    if (verdict.avx2 === true) {
+      writeCpuFeatureRecord(true, verdict.evidence)
+      confirmed = false
+    } else if (verdict.avx2 === false) {
+      recordMachineLacksAvx2(verdict.evidence)
+      confirmed = true
+    } else if (confirmed) {
+      recordMachineLacksAvx2('crash')
     }
+    const cpuHasAvx2 = verdict.avx2 === true
 
     let version = metadata?.version || null
     let binaryChecksums = null
@@ -1651,9 +2201,11 @@ function createLauncher(productConfig) {
     })
     console.error('')
     console.error(
-      confirmed
-        ? `${packageName} is switching to the older-CPU binary for this machine.`
-        : `${packageName} crashed on startup; trying the older-CPU binary.`,
+      cpuHasAvx2
+        ? `${packageName} crashed, but this CPU supports AVX2; using the older-CPU binary until the next update.`
+        : confirmed
+          ? `${packageName} is switching to the older-CPU binary for this machine.`
+          : `${packageName} crashed on startup; trying the older-CPU binary.`,
     )
 
     try {
@@ -1669,6 +2221,27 @@ function createLauncher(productConfig) {
     return true
   }
 
+  /**
+   * What the evidence says about AVX2 after a crash: `{ avx2, evidence }`,
+   * avx2 null when nothing can tell. Bun's own verdict that AVX2 is missing
+   * wins, then the OS probe, then avx2 in Bun's `CPU:` line.
+   */
+  function crashAvx2Verdict(code, signal, stderrTail) {
+    if (
+      stderrTail &&
+      !(code === 0 && !signal) &&
+      BUN_NO_AVX2_FEATURE.test(sanitizeForReplay(stderrTail))
+    ) {
+      return { avx2: false, evidence: 'bun-report' }
+    }
+    const probed = probeCpuAvx2()
+    if (probed !== null) return { avx2: probed, evidence: cpuProbeSource() }
+    if (stderrReportsAvx2Present(stderrTail)) {
+      return { avx2: true, evidence: 'bun-report' }
+    }
+    return { avx2: null, evidence: null }
+  }
+
   function attachExitHandler(child, allowBaselineFallback = true) {
     const exitListener = async (code, signal) => {
       // A child we never watched (only reachable from a test) reports no age
@@ -1676,15 +2249,18 @@ function createLauncher(productConfig) {
       // as a startup crash and trigger a download.
       const msAlive = child.launch ? child.launch.msAlive() : Infinity
 
+      // Any failed exit, not only a native crash code: a Bun crash on Windows
+      // usually exits with plain code 3, and the reason is only in its stderr
+      // (see stderrReportsMissingCpuFeature). Clean exits skip the wait.
       let stderrTail = ''
-      if (child.launch && (isWindowsNativeCrashCode(code) || signal)) {
+      if (child.launch && (code !== 0 || signal)) {
         await child.launch.drained()
         stderrTail = child.launch.stderrTail()
       }
 
       if (
         allowBaselineFallback &&
-        (await tryFallbackToBaseline(code, signal, msAlive))
+        (await tryFallbackToBaseline(code, signal, msAlive, stderrTail))
       ) {
         return
       }
@@ -1693,6 +2269,7 @@ function createLauncher(productConfig) {
         exitAlternateScreen: shouldExitAlternateScreen(code, signal),
       })
       printCrashDiagnostics(code, signal, { msAlive, stderrTail })
+      installPendingUpdate(child)
       process.exit(signal ? 1 : code || 0)
     }
 
@@ -1706,6 +2283,7 @@ function createLauncher(productConfig) {
     }
     if (startupBanner.length > 0) console.log('')
 
+    await adoptOrphanedStagedUpdates()
     await ensureBinaryReady()
 
     const child = spawnInstalledBinary()
@@ -1727,9 +2305,16 @@ function createLauncher(productConfig) {
       detectMachineHasAvx2,
       recordMachineLacksAvx2,
       readCachedAvx2,
+      readCpuFeatureRecord,
+      parseCpuinfoAvx2,
+      parseSysctlAvx2,
+      stderrReportsAvx2Present,
+      getDownloadTargetKey,
       isIllegalInstructionExit,
       isStartupCpuFeatureCrash,
+      stderrReportsMissingCpuFeature,
       tryFallbackToBaseline,
+      adoptOrphanedStagedUpdates,
       printCrashDiagnostics,
       checkForUpdates,
       spawnInstalledBinary,

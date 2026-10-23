@@ -258,7 +258,7 @@ export interface ReadDocsParams {
 }
 
 /**
- * Read the multiple files from disk and return their contents. Use this tool to read as many files as would be helpful to answer the user's request.
+ * Read multiple files from disk. Returned file content shares a 20,000 estimated-token limit and a 100,000-character hard limit, so prefer the smallest relevant set.
  */
 export interface ReadFilesParams {
   /** List of file paths to read. */
@@ -420,7 +420,7 @@ export interface WebSearchParams {
  * Create or edit a file with the given content.
  */
 export interface WriteFileParams {
-  /** Path to the file relative to the **project root** */
+  /** Path to the file, relative to the **project root**. Local hosts (CLI, Desktop, SDK) also accept an absolute path, which is not limited to the project. */
   path: string
   /** What the change is intended to do in only one sentence. */
   instructions: string
@@ -429,10 +429,10 @@ export interface WriteFileParams {
 }
 
 /**
- * Write a todo list to track tasks for multi-step implementations. Use this frequently to maintain an updated step-by-step plan.
+ * Write a todo list to track tasks for multi-step implementations. Keep it updated as you complete each step.
  */
 export interface WriteTodosParams {
-  /** List of todos with their completion status. Add ALL of the applicable tasks to the list, so you don't forget to do anything. Try to order the todos the same way you will complete them. Do not mark todos as completed if you have not completed them yet! */
+  /** List of todos with their completion status. List every step the user's request requires, so you don't forget any, and nothing it does not: no extra features, refactors or polish. Try to order the todos the same way you will complete them. Do not mark todos as completed if you have not completed them yet! */
   todos: {
     /** Description of the task */
     task: string

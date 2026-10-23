@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, test } from 'bun:test'
+import { afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import { FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID } from '@codebuff/common/constants/freebuff-model-ids'
 import { createTestRenderer } from '@opentui/core/testing'
 import { createRoot, flushSync } from '@opentui/react'
@@ -8,6 +8,7 @@ import { StatusBar } from '../status-bar'
 import { initializeThemeStore } from '../../hooks/use-theme'
 import { useChatStore } from '../../state/chat-store'
 import { IS_FREEBUFF } from '../../utils/constants'
+import { useByokSelectionStore } from '../../utils/byok'
 import { getStatusIndicatorState } from '../../utils/status-indicator-state'
 
 import type { FreebuffSessionResponse } from '../../types/freebuff-session'
@@ -16,6 +17,13 @@ import type { RunState } from '@codebuff/sdk'
 beforeAll(() => {
   initializeThemeStore()
 })
+
+let previousByok: ReturnType<typeof useByokSelectionStore.getState>['selected']
+beforeEach(() => {
+  previousByok = useByokSelectionStore.getState().selected
+  useByokSelectionStore.setState({ selected: undefined })
+})
+afterEach(() => useByokSelectionStore.setState({ selected: previousByok }))
 
 describe('StatusBar', () => {
   test('renders working for the streaming phase', async () => {
@@ -86,19 +94,113 @@ describe('StatusBar', () => {
             isAtBottom
             scrollToLatest={() => {}}
             statusIndicatorState={statusIndicatorState}
+            freebuffSession={null}
+            onEndSession={() => {}}
+          />,
+        )
+      })
+      await setup.renderOnce()
+      flushSync(() => {
+        root.render(
+          <StatusBar
+            timerStartTime={null}
+            isAtBottom
+            scrollToLatest={() => {}}
+            statusIndicatorState={statusIndicatorState}
             freebuffSession={session}
+            onEndSession={() => {}}
           />,
         )
       })
 
       try {
         await setup.renderOnce()
+        // Exercise repainting after the progress background is mounted.
+        await setup.renderOnce()
         const frame = setup.captureCharFrame()
         // 142,310 of DeepSeek V4 Flash's 1,048,576-token window → 14%.
         expect(frame).toContain('unlimited · 142.3K (14%)')
+        expect(frame).not.toContain('DeepSeek')
+        expect(frame).not.toContain(' • ')
+        expect(frame).toContain('✕ End session')
       } finally {
         flushSync(() => root.unmount())
         setup.renderer.destroy()
+        useChatStore.getState().setRunState(null)
+      }
+    },
+  )
+
+  test.skipIf(!IS_FREEBUFF)(
+    'draws no clock on a row the server marks untimed',
+    async () => {
+      const now = Date.now()
+      const freebucks = {
+        balance: 150,
+        daily: { limit: 150, spent: 0, remaining: 150, resetAt: '' },
+        wallet: { balance: 0, monthlyBonus: 0 },
+        planId: null,
+        prices: { [FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID]: 15 },
+        spendWithoutAsking: true,
+      }
+      const session = (untimed: boolean) =>
+        ({
+          status: 'active',
+          accessTier: 'full',
+          instanceId: 'test-instance',
+          model: FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
+          admittedAt: new Date(now - 60_000).toISOString(),
+          expiresAt: new Date(now + 3_540_000).toISOString(),
+          remainingMs: 3_540_000,
+          freebucks: untimed
+            ? {
+                ...freebucks,
+                untimedModelIds: [FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID],
+              }
+            : freebucks,
+        }) as FreebuffSessionResponse
+      useChatStore.getState().setRunState({
+        sessionState: {
+          mainAgentState: { contextTokenCount: 142_310 },
+        },
+      } as RunState)
+      const idle = getStatusIndicatorState({
+        statusMessage: null,
+        streamStatus: 'idle',
+        nextCtrlCWillExit: false,
+        isConnected: true,
+      })
+      const frameFor = async (untimed: boolean) => {
+        const setup = await createTestRenderer({ width: 140, height: 3 })
+        const root = createRoot(setup.renderer)
+        try {
+          flushSync(() => {
+            root.render(
+              <StatusBar
+                timerStartTime={null}
+                isAtBottom
+                scrollToLatest={() => {}}
+                statusIndicatorState={idle}
+                freebuffSession={session(untimed)}
+                onEndSession={() => {}}
+              />,
+            )
+          })
+          await setup.renderOnce()
+          return setup.captureCharFrame()
+        } finally {
+          flushSync(() => root.unmount())
+          setup.renderer.destroy()
+        }
+      }
+
+      try {
+        expect(await frameFor(false)).toContain('59m left · 142.3K (14%)')
+        const untimed = await frameFor(true)
+        expect(untimed).not.toContain('left')
+        expect(untimed).toContain('142.3K (14%)')
+        expect(untimed).toContain('✕ End session')
+      } finally {
         useChatStore.getState().setRunState(null)
       }
     },

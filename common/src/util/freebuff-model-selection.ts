@@ -1,4 +1,6 @@
+import { isFreebuffLimitedTierPlanOnlyModelId } from '../constants/freebuff-models'
 import { isFreebuffSubscriptionProModelId } from '../constants/freebuff-subscriptions'
+import type { FreebuffAccessTier } from '../constants/freebuff-models'
 import type { FreebuffFreebucksInfo } from '../types/freebuff-session'
 import { getFreebuffModelMeter } from './freebuff-session-pools'
 
@@ -22,14 +24,40 @@ export function freebuffPlanRequired(
   hasPaidSubscription: boolean,
   /** The session response's Freebucks block, when the caller has it. Its
    *  `planRequiredModelIds` is the SERVER's per-viewer verdict and wins over
-   *  the static list: a US viewer opens FREEBUFF_US_OR_PAID_MODEL_IDS rows
-   *  with no plan, which no client can work out for itself. */
+   *  the static list: it also locks the rows a plan unlocks at LIMITED
+   *  access (FREEBUFF_LIMITED_TIER_PLAN_ONLY_MODEL_IDS) for a viewer there. */
   freebucks?: Pick<FreebuffFreebucksInfo, 'planRequiredModelIds'> | null,
+  /** The access tier the session response resolved to. Only read when the
+   *  server sent no verdict (no Freebucks block, a balance that is
+   *  unavailable, an older server): at LIMITED access the fallback is then
+   *  the same list the server would have sent there,
+   *  FREEBUFF_LIMITED_TIER_PLAN_ONLY_MODEL_IDS. Since 2026-09-30 the limited
+   *  catalog LISTS those rows to an account without a plan, so falling back
+   *  to the full-access paid-only list would draw GPT-6 Luna and MiMo 2.6 Pro
+   *  as ordinary, startable rows that admission then refuses. */
+  accessTier?: FreebuffAccessTier | null,
 ): boolean {
   if (hasPaidSubscription) return false
   const serverVerdict = freebucks?.planRequiredModelIds
   if (serverVerdict) return serverVerdict.includes(modelId)
+  if (accessTier === 'limited' && isFreebuffLimitedTierPlanOnlyModelId(modelId))
+    return true
   return isFreebuffSubscriptionProModelId(modelId)
+}
+
+/**
+ * Whether a session on `modelId` hides its clock: no time left, countdown or
+ * hour-end notice. The SERVER's per-viewer verdict (`untimedModelIds`), never
+ * a local reading of tier or price; absent keeps the clock.
+ */
+export function freebuffSessionUntimed(
+  modelId: string | undefined,
+  freebucks: Pick<FreebuffFreebucksInfo, 'untimedModelIds'> | null | undefined,
+): boolean {
+  return (
+    modelId !== undefined &&
+    freebucks?.untimedModelIds?.includes(modelId) === true
+  )
 }
 
 /** The locked row's short label, for a badge or a detail line. */
@@ -62,6 +90,8 @@ export function freebucksRowIntent(
   if (!freebucks || price === undefined)
     return { kind: 'allow', price, walletSpend: 0 }
   if (!canStart) return { kind: 'paywall', price, walletSpend: 0 }
+  // Full access is never asked: no wallet, claim or session-ending question.
+  if (freebucks.spendWithoutAsking) return { kind: 'allow', price, walletSpend: 0 }
   if (freebucks.balance < price && freebucks.quotaExempt)
     return { kind: 'allow', price, walletSpend: 0 }
   const walletSpend = Math.max(0, price - freebucks.daily.remaining)

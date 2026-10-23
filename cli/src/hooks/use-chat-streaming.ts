@@ -13,6 +13,12 @@ import { useQueueControls } from './use-queue-controls'
 import { useQueueUi } from './use-queue-ui'
 import { useTimeout } from './use-timeout'
 import { useChatRuntime } from '../contexts/chat-runtime-context'
+import { useChatStore } from '../state/chat-store'
+import { setConnectionMonitorBusy } from '../utils/connection-monitor'
+import {
+  sponsoredTurnHoldsQueue,
+  useSponsoredRunStore,
+} from '../state/sponsored-run-store'
 
 import type { QueuedMessage, StreamStatus } from './use-message-queue'
 import type { PendingAttachment } from '../types/store'
@@ -116,6 +122,22 @@ export function useChatStreaming({
     clearQueue,
   } = runtime
 
+  // A plain message sent now joins the running task. Not during a sponsored
+  // turn: it has no steering mailbox, so messages wait in the queue.
+  const isChainInProgress = useChatStore((state) => state.isChainInProgress)
+  const sponsoredHoldsQueue = useSponsoredRunStore((state) =>
+    sponsoredTurnHoldsQueue(state.snapshot),
+  )
+  const steersRun =
+    (isStreaming || isChainInProgress) && !sponsoredHoldsQueue
+
+  // Skip redundant health checks during a turn when the monitor is already connected.
+  // If offline, it keeps probing with backoff so recovery can clear the status mid-turn.
+  useEffect(() => {
+    setConnectionMonitorBusy(isStreaming || isChainInProgress)
+    return () => setConnectionMonitorBusy(false)
+  }, [isStreaming, isChainInProgress])
+
   // Queue UI
   const {
     queuedCount,
@@ -127,6 +149,7 @@ export function useChatStreaming({
     queuedMessages,
     separatorWidth,
     terminalWidth,
+    steersRun,
   })
 
   // Exit handling

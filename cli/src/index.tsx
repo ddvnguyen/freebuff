@@ -14,7 +14,11 @@ import path from 'path'
 import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
 import { getProjectFileTree } from '@codebuff/common/project-file-tree'
 import { getDefaultAgentDirs, getWebsiteUrl } from '@codebuff/sdk'
-import { createCliRenderer } from '@opentui/core'
+import {
+  createCliRenderer,
+  resolveRenderLib,
+  setRenderLibPath,
+} from '@opentui/core'
 import { createRoot } from '@opentui/react'
 import {
   QueryClient,
@@ -31,25 +35,41 @@ import { runPlainLogin } from './login/plain-login'
 import { initializeApp } from './init/init-app'
 import { getProjectRoot, setProjectRoot } from './project-files'
 import { trackEvent } from './utils/analytics'
+import { captureCliFunnel } from './utils/cli-product-funnel'
+import { installAiSdkWarningLogger } from './utils/ai-sdk-warnings'
 import {
   getTrustStorePath,
   isTruthyOptIn,
   promptForAgentDirTrust,
   resolveTrustedAgentDirs,
 } from './utils/agent-dir-trust'
-import { getAuthToken, getAuthTokenDetails } from './utils/auth'
+import {
+  getAuthToken,
+  getAuthTokenDetails,
+  loadStoredAuthToken,
+} from './utils/auth'
 import { resetCodebuffClient } from './utils/codebuff-client'
 import { setApiClientAuthToken } from './utils/codebuff-api'
 import { IS_FREEBUFF } from './utils/constants'
 import { getCliEnv } from './utils/env'
+import { getConfigDir } from './utils/config-dir'
+import {
+  bunExtractionTempDir,
+  defaultRenderLibraryCacheDir,
+  ensureRenderLibrary,
+  findEmbeddedRenderLibrary,
+  sweepLeakedRenderLibraryCopies,
+} from './utils/opentui-native-library'
 import { initializeAgentRegistry } from './utils/local-agent-registry'
 import { trimOversizedChatLogs } from './utils/chat-history'
 import { clearLogFile, logger } from './utils/logger'
 import { drainClientLogs } from './utils/log-shipper'
+import { takePreviousFatalCrash } from './utils/fatal-crash-report'
 import { shouldShowProjectPicker } from './utils/project-picker'
 import { saveRecentProject } from './utils/recent-projects'
 import { startEngagementTracking } from './utils/engagement'
 import {
+  CLI_RENDERER_EXIT_SIGNALS,
   exitCliWithFatalError,
   installProcessCleanupHandlers,
 } from './utils/renderer-cleanup'
@@ -58,6 +78,10 @@ import { startTerminalWatchdog } from './utils/terminal-watchdog'
 import { installTerminalProtocolController } from './utils/terminal-protocol-controller'
 import { initializeSkillRegistry } from './utils/skill-registry'
 import { detectTerminalTheme } from './utils/terminal-color-detection'
+import {
+  noteTerminalColorReply,
+  startClientEnvironmentProbe,
+} from './utils/client-environment'
 import { setOscDetectedTheme } from './utils/theme-system'
 
 import type { FileTreeNode } from '@codebuff/common/util/file'
@@ -214,6 +238,7 @@ async function main(): Promise<void> {
   if (process.stdin.isTTY && process.platform !== 'win32') {
     try {
       const oscTheme = await detectTerminalTheme()
+      noteTerminalColorReply(oscTheme !== null)
       if (oscTheme) {
         setOscDetectedTheme(oscTheme)
       }
@@ -221,6 +246,10 @@ async function main(): Promise<void> {
       // Silently ignore OSC detection failures
     }
   }
+
+  // The Freebuff auth token lives in the OS keychain (auth-token-store.ts):
+  // load it before anything reads the credentials. Bounded and never throws.
+  await loadStoredAuthToken()
 
   const {
     initialPrompt,
@@ -243,6 +272,15 @@ async function main(): Promise<void> {
   // Set the auth token for the API client
   setApiClientAuthToken(getAuthToken())
 
+  captureCliFunnel(
+    'launch',
+    'started',
+    {
+      entry_account_state: getAuthToken() ? 'stored_credentials' : 'signed_out',
+    },
+    'launch',
+  )
+
   // Handle login command before rendering the app
   if (isLoginCommand) {
     await runPlainLogin()
@@ -254,6 +292,13 @@ async function main(): Promise<void> {
   const homeDir = os.homedir()
   const startCwd = process.cwd()
   const showProjectPicker = shouldShowProjectPicker(startCwd, homeDir)
+  if (!showProjectPicker)
+    captureCliFunnel(
+      'context',
+      'succeeded',
+      { project_kind: 'local' },
+      'initial',
+    )
 
   // Requires analytics to be initialized, which is done in initializeApp
   trackEvent(AnalyticsEvent.APP_LAUNCHED, {
@@ -265,7 +310,23 @@ async function main(): Promise<void> {
     continueChat,
     initialMode: initialMode ?? 'DEFAULT',
     isFreeBuff: IS_FREEBUFF,
+    // The npm wrapper's version, null when not started by one. Wrappers never
+    // update themselves, and only newer ones adopt an update the terminal
+    // closed on, so this splits "pinned build" by install path.
+    launcherVersion:
+      getCliEnv().CODEBUFF_LAUNCHER_VERSION?.slice(0, 32) ?? null,
   })
+  // The previous launch died on a fatal error and could only leave a local
+  // report on its way out; ship it now (fatal-crash-report.ts).
+  const previousCrash = takePreviousFatalCrash()
+  if (previousCrash) {
+    try {
+      trackEvent(AnalyticsEvent.CLI_FATAL_CRASH, previousCrash)
+      void drainClientLogs()
+    } catch {
+      // Crash telemetry must never block a launch.
+    }
+  }
   // Start shipping the launch row now, well before the Windows watchdog is
   // armed. If endpoint security terminates this process during that spawn, the
   // next --continue launch still has a prior row for the health dashboard's
@@ -386,6 +447,7 @@ async function main(): Promise<void> {
       async (newProjectPath: string) => {
         // Change process working directory
         process.chdir(newProjectPath)
+        captureCliFunnel('context', 'succeeded', { project_kind: 'folder' })
 
         // Track directory change (avoid logging full paths for privacy)
         const isGitRepo = fs.existsSync(path.join(newProjectPath, '.git'))
@@ -445,12 +507,56 @@ async function main(): Promise<void> {
   // minutes and report a flood (cli.helper_process_flood) — the symptom users
   // see in Task Manager, which nothing server-side can observe.
   startWindowsMachineProcessCensus()
+  // Background, one-time; the descriptor reads `unknown` until it resolves.
+  if (IS_FREEBUFF) void startClientEnvironmentProbe()
 
+  // The SDK defaults to process.emitWarning(), which bypasses OpenTUI's
+  // console capture and overwrites whichever terminal rows were last drawn.
+  const restoreAiSdkWarnings = installAiSdkWarningLogger((warnings) =>
+    logger.warn(warnings, 'AI SDK warning'),
+  )
+  // Load the native renderer up front, so a temp directory that is full,
+  // read-only or noexec gets a fallback copy and, failing that, an actionable
+  // message instead of "Failed to initialize OpenTUI render library".
+  const renderLibrarySource = await ensureRenderLibrary({
+    resolve: resolveRenderLib,
+    setPath: setRenderLibPath,
+    embeddedFiles: () => Bun.embeddedFiles,
+    cacheDir: () => defaultRenderLibraryCacheDir(getConfigDir()),
+    tempDir: () => bunExtractionTempDir(),
+  })
+  if (renderLibrarySource === 'cache') {
+    logger.warn(
+      { tempDir: bunExtractionTempDir() },
+      'Loaded the terminal renderer from the config directory: the temp directory copy failed',
+    )
+  }
+  // Bun leaves a full copy of the renderer library in the temp directory on
+  // every launch; reclaim older ones off the startup path.
+  setTimeout(() => {
+    const library = findEmbeddedRenderLibrary(Bun.embeddedFiles)
+    if (!library) return
+    void sweepLeakedRenderLibraryCopies({
+      library,
+      tempDir: bunExtractionTempDir(),
+    })
+      .then(({ removed, bytes }) => {
+        if (removed > 0) {
+          logger.info(
+            { removed, bytes },
+            'Removed stale renderer library copies from the temp directory',
+          )
+        }
+      })
+      .catch(() => {})
+  }, 0)
   const renderer = await createCliRenderer({
     backgroundColor: 'transparent',
     exitOnCtrlC: false,
+    exitSignals: CLI_RENDERER_EXIT_SIGNALS,
     screenMode: 'alternate-screen',
   })
+  renderer.once('destroy', restoreAiSdkWarnings)
 
   // Install the renderer-aware handlers before removing the startup safety net
   // so an installation failure still restores the terminal and reports itself.

@@ -13,6 +13,8 @@ const SAMPLED_EVENT_RATES: Partial<Record<AnalyticsEvent, number>> = {
 const ALWAYS_TRACK_EVENTS = new Set<AnalyticsEvent>([
   // DAU is measured from MESSAGE_SENT, so it must never be sampled.
   AnalyticsEvent.MESSAGE_SENT,
+  // Every conversion stage must have the same unsampled denominator.
+  AnalyticsEvent.PRODUCT_FUNNEL_STEP,
   // Engaged-time is summed from event counts, so it must never be sampled.
   AnalyticsEvent.PRODUCT_ACTIVE_MINUTE,
   AnalyticsEvent.APP_LAUNCHED,
@@ -38,7 +40,11 @@ const ALWAYS_TRACK_EVENTS = new Set<AnalyticsEvent>([
   AnalyticsEvent.DESKTOP_LOGOUT,
   AnalyticsEvent.DESKTOP_THREAD_CREATED,
   AnalyticsEvent.DESKTOP_PROJECT_OPENED,
+  AnalyticsEvent.DESKTOP_PROJECT_CREATED,
   AnalyticsEvent.DESKTOP_TURN_COMPLETED,
+  AnalyticsEvent.DESKTOP_FUNNEL_STEP,
+  AnalyticsEvent.DESKTOP_ACQUISITION_STEP,
+  AnalyticsEvent.FREEBUFF_AUTH_STEP,
   // Low-volume recovery funnel. Sampling any stage independently would make
   // creation-to-success and repeated-failure rates impossible to measure.
   AnalyticsEvent.DESKTOP_FAILED_TURN_RECOVERY,
@@ -48,11 +54,13 @@ const ALWAYS_TRACK_EVENTS = new Set<AnalyticsEvent>([
   // useful if every one is counted.
   AnalyticsEvent.DESKTOP_TURN_BACKGROUND_WAIT,
   // Feature adoption is measured as UNIQUE USERS per feature. At desktop's
-  // ~1-2k DAU a 1% sample would leave a feature used by 2% of users with
+  // scale a 1% sample would leave a feature used by 2% of users with
   // roughly zero sampled users — the number is unrecoverable from a sample, so
   // this one is never sampled. Volume is controlled at the emit site instead
   // (intent-only actions + per-session dedupe), not by throwing away users.
   AnalyticsEvent.DESKTOP_FEATURE_USED,
+  // Ratios use summed disjoint durations, so numerator and denominator stay whole.
+  AnalyticsEvent.DESKTOP_AD_DENSITY,
   AnalyticsEvent.DESKTOP_HARNESS_CHANGED,
   AnalyticsEvent.DESKTOP_MODEL_CHANGED,
   AnalyticsEvent.DESKTOP_SKILL_RUN,
@@ -68,6 +76,8 @@ const ALWAYS_TRACK_EVENTS = new Set<AnalyticsEvent>([
   AnalyticsEvent.CLI_HELPER_OUTLIVED_PARENT,
   AnalyticsEvent.DESKTOP_HELPER_PROCESS_FLOOD,
   AnalyticsEvent.UPDATE_CODEBUFF_FAILED,
+  // Crash counts per version must be whole to be comparable.
+  AnalyticsEvent.CLI_FATAL_CRASH,
 ])
 
 type AnalyticsProperties = Record<string, unknown> | undefined

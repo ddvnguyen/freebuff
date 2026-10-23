@@ -5,12 +5,11 @@ import { useShallow } from 'zustand/react/shallow'
 import { Chat } from './chat'
 import { ChatHistoryScreen } from './components/chat-history-screen'
 import { ChatRuntimeProvider } from './contexts/chat-runtime-context'
-import { FreebuffSupersededScreen } from './components/freebuff-superseded-screen'
 import { LoginModal } from './components/login-modal'
 import { ProjectPickerScreen } from './components/project-picker-screen'
-import { FreebuffLandingScreen } from './components/freebuff-landing-screen'
 import { useAuthQuery } from './hooks/use-auth-query'
 import { useAuthState } from './hooks/use-auth-state'
+import { useFreebuffModelCatalog } from './hooks/use-freebuff-model-catalog'
 import { useFreebuffSession } from './hooks/use-freebuff-session'
 import { useTerminalFocus } from './hooks/use-terminal-focus'
 import { getProjectRoot, startNewChat } from './project-files'
@@ -19,10 +18,7 @@ import { stopActiveRun } from './utils/active-run'
 import { useChatStore } from './state/chat-store'
 import type { TopBannerType } from './types/store'
 import { IS_FREEBUFF } from './utils/constants'
-import {
-  useBypassesFreebuffSession,
-  useByokSelectionStore,
-} from './utils/byok'
+import { useByokSelectionStore } from './utils/byok'
 import { findGitRoot } from './utils/git'
 
 import type { MultilineInputHandle } from './components/multiline-input'
@@ -172,6 +168,7 @@ export const App = ({
 
   // State to track which chat to resume (set when user selects from history)
   const [resumeChatId, setResumeChatId] = useState<string | null>(null)
+  const [continueRequested, setContinueRequested] = useState(continueChat)
 
   const handleResumeChat = useCallback(
     (chatId: string) => {
@@ -183,6 +180,7 @@ export const App = ({
       // Reset chat store to clear previous messages before loading the selected chat
       resetChatStore()
       setResumeChatId(chatId)
+      setContinueRequested(true)
     },
     [closeChatHistory, resetChatStore],
   )
@@ -195,10 +193,11 @@ export const App = ({
     // instead of overwriting the current (possibly resumed) chat's history
     startNewChat()
     setResumeChatId(null)
+    setContinueRequested(false)
   }, [closeChatHistory, resetChatStore])
 
   // Determine effective continueChat values
-  const effectiveContinueChat = continueChat || resumeChatId !== null
+  const effectiveContinueChat = continueRequested
   const effectiveContinueChatId = resumeChatId ?? continueChatId
 
   // Derive auth reachability + retrying state from authQuery error
@@ -307,10 +306,11 @@ const AuthedSurface = (props: AuthedSurfaceProps) => {
   const hasSelectedByokConnection = useByokSelectionStore(
     (state) => state.selected !== undefined,
   )
-  const {
-    session,
-    failure: sessionFailure,
-  } = useFreebuffSession({ enabled: !hasSelectedByokConnection })
+  // Before the session: its first request waits for the first catalog.
+  useFreebuffModelCatalog({ enabled: !hasSelectedByokConnection })
+  const { session, lastRefund, refundPending } = useFreebuffSession({
+    enabled: !hasSelectedByokConnection,
+  })
 
   return (
     <ChatRuntimeProvider
@@ -323,13 +323,14 @@ const AuthedSurface = (props: AuthedSurfaceProps) => {
       <AuthedSurfaceRoutes
         {...props}
         session={session}
-        sessionFailure={sessionFailure}
+        lastRefund={lastRefund}
+        refundPending={refundPending}
       />
     </ChatRuntimeProvider>
   )
 }
 
-const AuthedSurfaceRoutes = ({
+export const AuthedSurfaceRoutes = ({
   consumeInitialPrompt,
   fileTree,
   inputRef,
@@ -345,62 +346,15 @@ const AuthedSurfaceRoutes = ({
   onCancelChatHistory,
   onNewChat,
   session,
-  sessionFailure,
+  lastRefund,
+  refundPending,
 }: AuthedSurfaceProps & {
   session: ReturnType<typeof useFreebuffSession>['session']
-  sessionFailure: ReturnType<typeof useFreebuffSession>['failure']
+  lastRefund: ReturnType<typeof useFreebuffSession>['lastRefund']
+  refundPending: boolean
 }) => {
-  // A selected connection, or BYOK setup opened from a Freebuff wall, reaches
-  // the chat without a Freebuff session.
-  const hasSelectedByokConnection = useBypassesFreebuffSession()
-  // Terminal state: a 409 from the gate means another CLI rotated our
-  // instance id. Show a dedicated screen and stop polling — don't fall back
-  // into the pre-chat screen, which would look like normal startup progress.
-  if (
-    IS_FREEBUFF &&
-    !hasSelectedByokConnection &&
-    session?.status === 'superseded'
-  ) {
-    return <FreebuffSupersededScreen />
-  }
-
-  // Route every non-admitted state through the pre-chat screen:
-  //   null     → initial GET in flight (brief)
-  //   'none'   → no seat yet; show model-picker landing
-  //   'country_blocked' → terminal region-gate message
-  //   'banned' → terminal account-banned message
-  //   'rate_limited' → hit shared session quota; terminal for this run
-  //   'spend_limited' → daily provider-spend budget; return after reset
-  //   'ip_capped' → too many distinct users active on this egress IP
-  //   'takeover_prompt' → another local CLI already holds this account
-  //
-  // 'ended' deliberately falls through to <Chat>: the agent may still be
-  // finishing work under the server-side grace period, and the chat surface
-  // itself swaps the input box for the session-ended banner.
-  if (
-    IS_FREEBUFF &&
-    !hasSelectedByokConnection &&
-    (session === null ||
-      session.status === 'none' ||
-      session.status === 'country_blocked' ||
-      session.status === 'banned' ||
-      session.status === 'rate_limited' ||
-      session.status === 'spend_limited' ||
-      session.status === 'ip_capped' ||
-      session.status === 'takeover_prompt')
-  ) {
-    return (
-      <FreebuffLandingScreen
-        session={session}
-        failure={sessionFailure}
-      />
-    )
-  }
-
-  // Chat history renders inside AuthedSurface so the freebuff session stays
-  // mounted while the user browses history. Unmounting this surface would
-  // DELETE the session row and drop the user back onto the landing screen on
-  // return.
+  // Local history is readable independently of model admission. Keep this
+  // inside the runtime so browsing never tears down a running session.
   if (showChatHistory) {
     return (
       <ChatHistoryScreen
@@ -424,6 +378,8 @@ const AuthedSurfaceRoutes = ({
       gitRoot={gitRoot}
       onSwitchToGitRoot={onSwitchToGitRoot}
       freebuffSession={session}
+      freebuffLastRefund={lastRefund}
+      freebuffRefundPending={refundPending}
     />
   )
 }

@@ -8,6 +8,8 @@ import { getToolCallString } from '@codebuff/common/tools/utils'
 import { buildArray } from '@codebuff/common/util/array'
 import { formatAvailableSkillsXml } from '@codebuff/common/util/skills'
 import { pluralize } from '@codebuff/common/util/string'
+import { cloneDeepKeepingZod } from '../util/zod-safe-clone'
+import { serveInputSchema } from './serve-input-schema'
 import z from 'zod/v4'
 import { convertJsonSchemaToZod } from 'zod-from-json-schema'
 
@@ -455,19 +457,12 @@ export async function getToolSet(params: {
 
   const toolDefinitions = await additionalToolDefinitions()
   for (const [toolName, toolDefinition] of Object.entries(toolDefinitions)) {
-    // Shallow copy only. lodash cloneDeep corrupts zod v4 schemas: the clone
-    // keeps `safeParse` but loses the internal `_zod` graph, so downstream
-    // `z.toJSONSchema` throws and the schema used to be silently swapped for
-    // an accept-anything `z.object({}).passthrough()` — the model was then
-    // told the tool takes no params and every param'd MCP/custom tool call
-    // reached the handler with empty input. The def's other fields are plain
-    // JSON data (name/description/endsAgentStep/mcpOrigin), so a shallow
-    // spread is sufficient isolation.
-    const clonedDef = { ...toolDefinition }
-    // Custom tool inputSchema may be JSON Schema (from SDK) or Zod (from MCP)
-    // Ensure it's a Zod schema for the AI SDK
-    const zodSchema = ensureZodSchema(clonedDef.inputSchema)
-    const safeSchema = ensureJsonSchemaCompatible(zodSchema)
+    const clonedDef = cloneDeepKeepingZod(toolDefinition)
+    // Custom tool inputSchema may be JSON Schema (from SDK) or Zod (from MCP).
+    // JSON Schema is served verbatim (see serveInputSchema); the former
+    // unconditional zod round-trip stripped loose schemas to an empty
+    // object schema at the model.
+    const safeSchema = serveInputSchema(clonedDef.inputSchema)
     toolSet[toolName] = {
       ...clonedDef,
       inputSchema: safeSchema,

@@ -1,5 +1,12 @@
 import { z } from 'zod'
 
+import {
+  SPONSORED_EXECUTION_SURFACES,
+  supabaseFoundationMode,
+} from './sponsored-execution-surface'
+
+import type { SponsoredRunExecutionSurface } from './sponsored-execution-surface'
+
 /** Client evidence only: the execution host rechecks these facts before Accept. */
 export const sponsoredCapabilityReasonSchema = z.enum([
   'no_git_repository',
@@ -40,49 +47,36 @@ export const sponsoredLocalTargetSchema = z.discriminatedUnion('kind', [
     .object({ kind: z.literal('workspace'), workspaceId: z.string().uuid() })
     .strict(),
 ])
-/**
- * Where a local sponsored run executes. `desktop_windows` (COD-642) is the one
- * surface with NO OS sandbox: its protection is campaign review plus the
- * portable floor (`SPONSORED_WINDOWS_CONTAINMENT` in `./sponsored-windows`).
- * A Windows value on the wire admits nothing by itself — the server serves it
- * only behind `FREEBUFF_SPONSORED_WINDOWS` (every agentic campaign alike when
- * on), and the LEGACY Supabase format paths never serve it (Supabase reaches
- * Windows only as a generic candidate under the one funnel).
- */
-export const sponsoredExecutionSurfaceSchema = z.enum([
-  'desktop_macos',
-  'desktop_linux',
-  'desktop_windows',
-  'cli_macos',
-  'cli_linux',
-  'cli_wsl',
-])
-export type SponsoredExecutionSurface = z.infer<
-  typeof sponsoredExecutionSurfaceSchema
->
-
-/** The Desktop execution surfaces, one per OS a Desktop client reports. */
-export const SPONSORED_DESKTOP_EXECUTION_SURFACES = [
-  'desktop_macos',
-  'desktop_linux',
-  'desktop_windows',
-] as const satisfies readonly SponsoredExecutionSurface[]
-export type SponsoredDesktopExecutionSurface =
-  (typeof SPONSORED_DESKTOP_EXECUTION_SURFACES)[number]
+export {
+  SPONSORED_CLI_EXECUTION_SURFACES,
+  SPONSORED_DESKTOP_EXECUTION_SURFACES,
+  SPONSORED_EXECUTION_SURFACES,
+  SUPABASE_FOUNDATION_MODES,
+  isSponsoredCliExecutionSurface,
+  isSponsoredExecutionSurface,
+  sponsoredCliExecutionSurfaceForRequest,
+  sponsoredDesktopExecutionSurfaceForPlatform,
+  supabaseFoundationMode,
+  type SponsoredCliExecutionSurface,
+  type SponsoredDesktopExecutionSurface,
+  type SponsoredExecutionSurface,
+  type SupabaseFoundationMode,
+} from './sponsored-execution-surface'
 
 /**
- * The Desktop execution surface of the OS a Desktop process runs on, or null
- * for an OS Desktop does not run sponsored work on. What the client reports,
- * never what it is granted: the server decides whether that surface is served.
+ * The runtimes a sponsored run can execute, as the run itself sees them
+ * (COD-829): probed from INSIDE the sponsored sandbox, so a Node install the
+ * sandbox hides reads as missing. `python` is python3 or python.
  */
-export function sponsoredDesktopExecutionSurfaceForPlatform(
-  platform: string,
-): SponsoredDesktopExecutionSurface | null {
-  if (platform === 'darwin') return 'desktop_macos'
-  if (platform === 'linux') return 'desktop_linux'
-  if (platform === 'win32') return 'desktop_windows'
-  return null
-}
+export const SPONSORED_RUNTIMES = ['node', 'npx', 'bun', 'python'] as const
+export type SponsoredRuntime = (typeof SPONSORED_RUNTIMES)[number]
+export const sponsoredRuntimeSchema = z.enum(SPONSORED_RUNTIMES)
+
+/** The wire schema of {@link SPONSORED_EXECUTION_SURFACES}. */
+export const sponsoredExecutionSurfaceSchema = z.enum(
+  SPONSORED_EXECUTION_SURFACES,
+)
+
 export const sponsoredCapabilitySchema = z
   .object({
     schemaVersion: z.literal(2),
@@ -102,36 +96,52 @@ export const sponsoredCapabilitySchema = z
     hasCommittedStorageBoundary: z.boolean().optional(),
     hasGitRepository: z.boolean(),
     hasCommittedHead: z.boolean(),
+    // COD-829. Absent means unknown (older clients, Windows, a probe that
+    // failed), never "nothing installed": only a reported list can warn.
+    availableRuntimes: z.array(sponsoredRuntimeSchema).max(8).optional(),
     execution: z
       .object({
         surface: sponsoredExecutionSurfaceSchema,
         status: z.enum(['available', 'unavailable']),
         reason: sponsoredCapabilityReasonSchema.optional(),
+        // Older Linux clients isolate networking; only updated clients report true.
+        outboundNetwork: z.boolean().optional(),
+        nativeDesktopTools: z.boolean().optional(),
       })
       .strict(),
   })
   .strict()
 
 export type SponsoredCapability = z.infer<typeof sponsoredCapabilitySchema>
+
+/**
+ * The browser workspace's worktree facts on the offer route: a v2 capability
+ * with NO `execution`. A Freebuff Web run's surface (`cloud_linux`) is
+ * server-assigned, never claimed on the wire (`SPONSORED_CLOUD_EXECUTION_SURFACE`),
+ * so the route adds it itself, and only for a request it proved came from the
+ * workspace server (`cloudSponsoredCapability` in `./web-agentic-offer`).
+ */
+export const cloudWorktreeCapabilitySchema = sponsoredCapabilitySchema.omit({
+  execution: true,
+})
+export type CloudWorktreeCapability = z.infer<
+  typeof cloudWorktreeCapabilitySchema
+>
+
+/**
+ * A capability as the server reads it: the wire's, or the browser workspace's
+ * with the server-assigned `cloud_linux` execution.
+ */
+export type SponsoredRunCapability = Omit<SponsoredCapability, 'execution'> & {
+  execution: Omit<SponsoredCapability['execution'], 'surface'> & {
+    surface: SponsoredRunExecutionSurface
+  }
+}
 export type SponsoredLocalTarget = z.infer<typeof sponsoredLocalTargetSchema>
 export type CapabilityInspection = z.infer<typeof capabilityInspectionSchema>
 export type SponsoredCapabilityReason = z.infer<
   typeof sponsoredCapabilityReasonSchema
 >
-
-export const SUPABASE_FOUNDATION_MODES = [
-  'foundation-mac',
-  'foundation-desktop',
-  'foundation-backend-desktop',
-  'foundation-local',
-  'foundation-all',
-] as const
-export type SupabaseFoundationMode = (typeof SUPABASE_FOUNDATION_MODES)[number]
-export function supabaseFoundationMode(
-  raw: string | null | undefined,
-): SupabaseFoundationMode | null {
-  return SUPABASE_FOUNDATION_MODES.find((mode) => mode === raw) ?? null
-}
 
 /**
  * The stacks the reviewed Supabase foundation procedure runs on. THE ONE LIST:

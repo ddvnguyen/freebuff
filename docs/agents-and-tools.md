@@ -25,6 +25,16 @@ and SDK `agentDefinitions` are never gated — they are code the user already
 chose to run. This is a trust floor, not isolation: sandboxing the eval,
 signing templates and pinning `latest` are separate work.
 
+Clients released before this gate (`codebuff` and `@codebuff/sdk` on npm) eval
+whatever the registry returns, so the registry GET routes refuse (403) a
+non-`codebuff` template with `handleSteps` unless the request carries
+`AGENT_TRUST_GATE_HEADER` (`common/src/constants/agents.ts`), which only the
+gated SDK sends (`untrustedHandleStepsRefusal` in
+`web/src/app/api/agents/_registry-guard.ts`). The server cannot see the
+caller's trusted set, so the header defers that decision to the client.
+`mcpServers` from non-`codebuff` publishers are refused outright, at publish
+and at GET, whatever the client.
+
 ### Trust gate for repository `.agents` directories
 
 `loadLocalAgents` dynamically imports every `.ts`/`.tsx`/`.js`/`.mjs`/`.cjs`
@@ -76,6 +86,49 @@ base-lite "fix this bug"
 ## Tools
 
 - Tool definitions live in `common/src/tools` and are executed via the SDK helpers + agent-runtime.
+
+### Skill resource paths
+
+Both the runtime `skill` tool and CLI `/skill:<name>` prompts use
+`common/src/util/skills.ts` → `formatSkillContent` to include the loaded skill's
+base directory. Bundled `scripts/`, `references/`, and `assets/` paths resolve
+against that directory, not the project cwd. Windows separators are normalized
+to forward slashes for file tools and Git Bash. Keep this context on both entry
+paths: the loader knows `filePath`, but raw SKILL.md content alone loses it and
+leaves the agent searching for resources it already loaded instructions for.
+
+### Explicit file reads versus discovery
+
+The SDK's `read_files` reads explicitly named text and images even when
+`.gitignore` or built-in discovery exclusions hide them (for example,
+`sandbox/` renders or dependency source). File-tree discovery and background
+project-understanding reads still apply those exclusions. Explicit reads honor
+`.codebuffignore` / `.manicodeignore` and caller-provided file filters; sensitive
+`.env` files remain blocked, and env templates still obey all project ignore
+rules. `.freebuffignore` controls workspace transfers, not this read policy.
+
+### Cut-off file edits are refused, never repaired
+
+`packages/agent-runtime/src/util/truncated-write-guard.ts` stops two shapes of
+a file edit that was cut off mid-generation:
+
+- **Arguments that never closed.** When a response hits the output limit (or
+  loses its connection) inside a tool call, the OpenAI-compatible provider
+  still flushes the call with whatever argument text arrived, and OpenRouter
+  reports the step as `finish_reason: "tool_calls"` (the real reason is only in
+  `native_finish_reason: "max_output_tokens"`). `parseRawToolCall` recognises
+  a truncated JSON prefix and answers with an explicit "nothing was written"
+  error instead of the generic re-issue hint, and does not echo the partial
+  content back. Do not add a JSON-repair step for mutating tools: completing a
+  cut-off `content` string is exactly how a file gets truncated on disk.
+- **A cut-off copy of an existing file.** `processFileBlock` refuses a
+  `write_file` that is under 60% of an existing file of 30+ lines AND leaves
+  brackets open where the current file balances them. Both refusals log
+  `axiomEvent: file_write_guard` (`metric` says which).
+
+The finish reason is deliberately not the signal: complete arguments in a
+length-cut step are a complete call, and the OpenRouter shape above hides the
+length cut anyway.
 
 ### Console-free terminal command broker
 

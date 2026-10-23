@@ -14,6 +14,7 @@ import {
 } from 'react'
 
 import { InputCursor } from './input-cursor'
+import { noteAdKeystroke } from '../ads/ad-signals'
 import { useTheme } from '../hooks/use-theme'
 import { useChatStore } from '../state/chat-store'
 import {
@@ -44,7 +45,7 @@ function getPasteText(event: PasteEvent): string {
 
 // Helper functions for text manipulation
 function findLineStart(text: string, cursor: number): number {
-  let pos = Math.max(0, Math.min(cursor, text.length))
+  let pos = clamp(cursor, 0, text.length)
   while (pos > 0 && text[pos - 1] !== '\n') {
     pos--
   }
@@ -52,7 +53,7 @@ function findLineStart(text: string, cursor: number): number {
 }
 
 function findLineEnd(text: string, cursor: number): number {
-  let pos = Math.max(0, Math.min(cursor, text.length))
+  let pos = clamp(cursor, 0, text.length)
   while (pos < text.length && text[pos] !== '\n') {
     pos++
   }
@@ -60,7 +61,7 @@ function findLineEnd(text: string, cursor: number): number {
 }
 
 function findPreviousWordBoundary(text: string, cursor: number): number {
-  let pos = Math.max(0, Math.min(cursor, text.length))
+  let pos = clamp(cursor, 0, text.length)
 
   // Skip whitespace backwards
   while (pos > 0 && /\s/.test(text[pos - 1])) {
@@ -76,7 +77,7 @@ function findPreviousWordBoundary(text: string, cursor: number): number {
 }
 
 function findNextWordBoundary(text: string, cursor: number): number {
-  let pos = Math.max(0, Math.min(cursor, text.length))
+  let pos = clamp(cursor, 0, text.length)
 
   // Skip non-whitespace forwards
   while (pos < text.length && !/\s/.test(text[pos])) {
@@ -184,6 +185,8 @@ interface MultilineInputProps {
   onSubmit: () => void
   onKeyIntercept?: (key: KeyEvent) => boolean
   onPaste: (fallbackText?: string) => void
+  /** Called with the text each key event inserts (not pastes). */
+  onTypedText?: (text: string) => void
   placeholder?: string
   focused?: boolean
   shouldBlinkCursor?: boolean
@@ -207,6 +210,7 @@ export const MultilineInput = forwardRef<
     onChange,
     onSubmit,
     onPaste,
+    onTypedText,
     placeholder = '',
     focused = true,
     shouldBlinkCursor,
@@ -428,7 +432,7 @@ export const MultilineInput = forwardRef<
 
   const moveCursor = useCallback(
     (nextPosition: number) => {
-      const clamped = Math.max(0, Math.min(value.length, nextPosition))
+      const clamped = clamp(nextPosition, 0, value.length)
       if (clamped === cursorPosition) return
       onChange({
         text: value,
@@ -1037,12 +1041,13 @@ export const MultilineInput = forwardRef<
       if (textToInsert !== null) {
         preventKeyDefault(key)
         insertTextAtCursor(textToInsert)
+        onTypedText?.(textToInsert)
         return true
       }
 
       return false
     },
-    [insertTextAtCursor],
+    [insertTextAtCursor, onTypedText],
   )
 
   // Increase StdinParser timeout from default 10ms to 100ms.
@@ -1108,9 +1113,17 @@ export const MultilineInput = forwardRef<
 
         // Delegate to specialized handlers
         if (handleEnterKeys(key)) return
-        if (handleDeletionKeys(key)) return
+        // COD-757: THAT a key edited the draft, and whether it deleted; never
+        // which key. Navigation and Enter are not typing.
+        if (handleDeletionKeys(key)) {
+          noteAdKeystroke(true)
+          return
+        }
         if (handleNavigationKeys(key)) return
-        if (handleCharacterInput(key)) return
+        if (handleCharacterInput(key)) {
+          noteAdKeystroke(false)
+          return
+        }
       },
       [
         focused,

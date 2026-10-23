@@ -1,37 +1,9 @@
-/** Historical Imprezia experiment id, retained for reporting. */
-export const IMPREZIA_EXPERIMENT = 'ads_imprezia_primary_2026_08'
-
 /**
- * Stable salt for request sampling. The sample key rotates per ad request, but
- * the hash must stay shared by the route gate and campaign allocator.
+ * An absent runtime knob is a dark deploy: a missing Infisical value must not
+ * open first-party inventory.
  */
-export const FIRST_PARTY_ROUTING_EXPERIMENT =
-  'ads_first_party_before_paid_networks_2026_08'
-
-/**
- * Salt for the sticky per-user first-party arm (COD-369).
- *
- * NOTHING ROUTES ON THIS TODAY. The arm is a LOGGED FIELD
- * (`first_party_arm_bucket` on `ads.fetch_completed`) and not an input to the
- * route draw, which stays on a fresh per-request `randomUUID()` exactly as it
- * was. A per-user draw would move which inventory a person gets, and that is a
- * delivery change that has to be costed on its own -- COD-362 flips routing
- * onto this once the logged buckets have produced a measured number.
- *
- * Dated, like every salt in this module, and for a stronger reason than the
- * others: once routing does read it, rotating it is the ONLY way to reshuffle
- * the arm, so a rotation is a new experiment and has to look like one.
- */
-export const FIRST_PARTY_ARM_SALT = 'ads_first_party_arm_2026_09'
-
-/**
- * An absent runtime knob is a dark deploy. Allocation is deliberately opt-in:
- * a missing Infisical value must not take paid-network inventory.
- */
-export const DEFAULT_FIRST_PARTY_PRIMARY_PERCENT = 0
 export const DEFAULT_FIRST_PARTY_BACKFILL = false
 export const DEFAULT_FIRST_PARTY_GEO_ROUTING = false
-export const DEFAULT_FIRST_PARTY_TIER2_BONUS_PERCENT = 0
 /**
  * The house leg (COD-358) is a dark deploy too: absent means the house
  * campaigns keep their legacy single door behind the paid rotation.
@@ -45,63 +17,22 @@ export const DEFAULT_FIRST_PARTY_HOUSE_LEG = false
  */
 export type FirstPartyAdGeoTier = 'tier1' | 'tier2' | 'unknown'
 
-export type FirstPartyAdRoute =
-  | 'paid_network_only'
-  | 'first_party_primary'
-  | 'gravity_then_first_party'
-  | 'paid_networks_then_first_party_bonus'
+/**
+ * Gravity sees every ordinary request first (the exclusivity contract,
+ * `common/src/util/ad-provider-policy.ts`), so no route puts our book ahead of
+ * it. `first_party_primary` and the retired Tier-2 bonus route
+ * (`paid_networks_then_first_party_bonus`) survive only in historical rows.
+ */
+export type FirstPartyAdRoute = 'paid_network_only' | 'gravity_then_first_party'
 
 export interface FirstPartyRoutingConfig {
-  /** Request share, 0..100, that tries our book before paid networks. */
-  primaryPercent: number
-  /** Whether the remaining paid-network cohort uses our book as backfill. */
+  /** Whether a released Gravity no-fill is backfilled from our book. */
   backfill: boolean
 }
 
 export interface FirstPartyGeoRoutingConfig extends FirstPartyRoutingConfig {
   /** Dark-deploy gate. Off preserves the pre-geo routing policy exactly. */
   geoRouting: boolean
-  /** Share of terminal Tier-2 paid no-fills offered non-billable inventory. */
-  tier2BonusPercent: number
-}
-
-/**
- * Normalize the percentage knob to the 10,000-bucket precision used by both
- * request routing and campaign allocation. Keeping this conversion shared
- * prevents decimal environment values from opening a route that the campaign
- * selector later rejects (or vice versa).
- */
-export function firstPartyPrimaryBasisPoints(primaryPercent: number): number {
-  const configuredPercent = Number.isFinite(primaryPercent)
-    ? primaryPercent
-    : DEFAULT_FIRST_PARTY_PRIMARY_PERCENT
-  return Math.round(Math.min(100, Math.max(0, configuredPercent)) * 100)
-}
-
-/**
- * Map one server-minted request sample to the allocator's 10,000-bucket space.
- * Both routing and campaign selection use this exact function so a request
- * admitted to first-party inventory cannot land in a different campaign slice.
- */
-export function firstPartyPrimaryBucket(sampleId: string): number {
-  return fnv1a(`${FIRST_PARTY_ROUTING_EXPERIMENT}:${sampleId}`) % 10_000
-}
-
-/**
- * The sticky sample key for one user's first-party arm.
- *
- * OBSERVATIONAL ONLY. Both rails feed it to {@link firstPartyPrimaryBucket}
- * and report the result as `first_party_arm_bucket`; neither feeds it to the
- * route draw or to campaign allocation, which keep reading the per-request
- * sample. Pointing routing at this is COD-362's job and changes delivery.
- *
- * Both rails always have a user id -- the browser route 401s without a
- * session and the v1 route is API-key authenticated -- so the empty-id case
- * is defensive rather than a supported path; it parks every anonymous caller
- * on one bucket.
- */
-export function firstPartyArmKey(userId: string | null | undefined): string {
-  return `fpa_${fnv1a(`${FIRST_PARTY_ARM_SALT}:${userId ?? ''}`).toString(36)}`
 }
 
 /**
@@ -192,15 +123,13 @@ export function cliDockArmServed(
   return mode === 'on' ? arm : 'control'
 }
 
-export type AdExperimentArm = 'imprezia_forced' | 'imprezia_first' | 'control'
-
-export function isImpreziaAudienceEmail(
-  email: string | null | undefined,
-): boolean {
-  if (!email) return false
-  const normalized = email.trim().toLowerCase()
-  return normalized.endsWith('@imprezia.ai')
-}
+/**
+ * The value every serve writes to `ad_impression.experiment_arm`. The column
+ * outlived the 2026-08 Imprezia experiment whose cohorts (`imprezia_forced`,
+ * `imprezia_first`) it recorded; Gravity exclusivity retired them and every
+ * serve since is `control`. Historical rows keep their old values.
+ */
+export type AdExperimentArm = 'control'
 
 /** FNV-1a 32-bit: tiny, dependency-free, stable across runtimes. */
 export function fnv1a(input: string): number {
@@ -240,33 +169,15 @@ export function houseSubscriptionBillingArmForUser(
     : 'yearly'
 }
 
-/** Gravity exclusivity retires the Imprezia cohorts. */
-export function adExperimentArmForUser(
-  _userId: string | null | undefined,
-  _userEmail?: string | null,
-): AdExperimentArm {
-  return 'control'
-}
-
 /**
- * Choose the request's routing policy.
- *
- * Production callers pass a fresh server-minted `sampleId` for each ad request
- * so a percentage applies to requests, not a permanently pinned set of users.
- * The fallback to `userId` preserves deterministic behavior for old callers
- * and tests. The function clamps direct callers defensively; the runtime env
- * schema rejects out-of-range values.
+ * Choose the request's routing policy: Gravity, then (when backfill is on) our
+ * book on a released no-fill. Our book never goes first.
  */
 export function firstPartyAdRouteForUser(
   userId: string | null | undefined,
   config: FirstPartyRoutingConfig,
-  sampleId?: string,
 ): FirstPartyAdRoute {
   if (!userId) return 'paid_network_only'
-  const bucket = firstPartyPrimaryBucket(sampleId || userId)
-  if (bucket < firstPartyPrimaryBasisPoints(config.primaryPercent)) {
-    return 'first_party_primary'
-  }
   return config.backfill ? 'gravity_then_first_party' : 'paid_network_only'
 }
 
@@ -274,8 +185,8 @@ export function firstPartyAdRouteForUser(
  * Whether the HOUSE leg may run on this request (COD-358).
  *
  * The house campaigns are our own promotion: they bill nobody, so none of
- * the sampled windows above apply to them. The leg follows paid no-fill, ahead
- * of bonus inventory, on Tier 1 AND Tier 2. Unknown geography stays closed
+ * the paid routes apply to them. The leg follows paid no-fill, on Tier 1 AND
+ * Tier 2. Unknown geography stays closed
  * while geo routing is on: a missing or untrusted signal never
  * opens inventory. With geo routing off there is no tier, and the knob alone
  * decides.
@@ -297,37 +208,23 @@ export function houseLegOpen(
 }
 
 /**
- * Apply the geo-aware policy without changing the legacy gate's semantics.
+ * Apply the geo-aware policy.
  *
- * - Tier 1 keeps the configured primary/backfill policy.
- * - Tier 2 never preempts a paid provider. Once the caller proves that every
- *   paid provider available on that surface has declined, a sampled request
- *   may receive explicitly non-billable bonus inventory.
- * - Unknown geography stays on paid networks only.
+ * - Tier 1 keeps the configured backfill policy.
+ * - Tier 2 and unknown geography stay on paid networks. Tier 2's own paid CPC
+ *   leg and the house leg are decided by the caller, not by this route. The
+ *   free Tier-2 bonus was removed on 2026-10-11.
  */
 export function firstPartyAdRouteForGeoRequest(
   userId: string | null | undefined,
   config: FirstPartyGeoRoutingConfig,
-  context: {
-    geoTier: FirstPartyAdGeoTier
-    terminalPaidFallback: boolean
-  },
-  sampleId?: string,
+  geoTier: FirstPartyAdGeoTier,
 ): FirstPartyAdRoute {
   if (!config.geoRouting) {
-    return firstPartyAdRouteForUser(userId, config, sampleId)
+    return firstPartyAdRouteForUser(userId, config)
   }
-  if (!userId) return 'paid_network_only'
-  if (context.geoTier === 'tier1') {
-    return firstPartyAdRouteForUser(userId, config, sampleId)
-  }
-  if (
-    context.geoTier === 'tier2' &&
-    context.terminalPaidFallback &&
-    firstPartyPrimaryBucket(sampleId || userId) <
-      firstPartyPrimaryBasisPoints(config.tier2BonusPercent)
-  ) {
-    return 'paid_networks_then_first_party_bonus'
+  if (geoTier === 'tier1') {
+    return firstPartyAdRouteForUser(userId, config)
   }
   return 'paid_network_only'
 }
@@ -516,9 +413,8 @@ export function clampSponsorBreakDismissLockMs(value: unknown): number {
 }
 
 /**
- * The sticky sample key for one user's sponsor-break arm. Shaped like
- * {@link firstPartyArmKey} so the two read the same at a call site, with its
- * own prefix so one cannot be passed to the other's bucket function unnoticed.
+ * The sticky sample key for one user's sponsor-break arm, with its own prefix
+ * so it cannot be passed to another arm's bucket function unnoticed.
  */
 export function sponsorBreakArmKey(userId: string | null | undefined): string {
   return `sbk_${fnv1a(`${SPONSOR_BREAK_ARM_SALT}:${userId ?? ''}`).toString(36)}`
@@ -634,4 +530,55 @@ export function showcaseArmForUser(
   if (config.mode === 'off') return 'control'
   if (!userId) return 'control'
   return showcaseArmBucket(userId) < SHOWCASE_SPLIT_BPS ? 'showcase' : 'control'
+}
+
+/**
+ * ============================================================================
+ * PRECOMPUTED AD SCORES (adscore treatment arm)
+ * ============================================================================
+ *
+ * A sticky 50/50 per-user split. `treatment` orders the ALREADY-ELIGIBLE
+ * first-party candidates by the user's precomputed per-creative scores
+ * (`packages/internal/src/ad-serving/ad-score-arm.ts`); `control` is today's
+ * ranking and never reads a score.
+ *
+ * NO KNOB. The experiment is gated on DATA: with no live snapshot
+ * (`user_ad_scored_candidates:v1:current` unset) a treatment request ranks
+ * exactly as control does, so the arm deploys inert and turns on when the
+ * candidate publisher commits its first snapshot. Pulling it is deleting the
+ * pointer, not an env edit.
+ *
+ * Its own dated salt, never a reuse: sharing one with the first-party arm
+ * would correlate the assignments and leave neither readout clean. Rotating it reshuffles every user, which is a new experiment.
+ */
+export const AD_SCORE_ARM_SALT = 'ads_precomputed_score_arm_2026_10'
+
+/**
+ * The experiment id the decision record carries for both arms, so a readout
+ * selects one id and splits on `experimentArm`.
+ */
+export const AD_SCORE_EXPERIMENT_ID = 'ads_precomputed_score_2026_10'
+
+/** Treatment share in the shared 10,000-bucket space: a straight 50/50. */
+export const AD_SCORE_TREATMENT_BASIS_POINTS = 5_000
+
+export const AD_SCORE_ARMS = ['control', 'treatment'] as const
+export type AdScoreArm = (typeof AD_SCORE_ARMS)[number]
+
+/** 0..9999, sticky per user, independent of every other salt here. */
+export function adScoreArmBucket(userId: string | null | undefined): number {
+  return fnv1a(`${AD_SCORE_ARM_SALT}:${userId ?? ''}`) % 10_000
+}
+
+/**
+ * The user's sticky arm. No user parks in `control`: both rails reject
+ * unauthenticated callers, so this is defensive rather than a supported path.
+ */
+export function adScoreArmForUser(
+  userId: string | null | undefined,
+): AdScoreArm {
+  if (!userId) return 'control'
+  return adScoreArmBucket(userId) < AD_SCORE_TREATMENT_BASIS_POINTS
+    ? 'treatment'
+    : 'control'
 }

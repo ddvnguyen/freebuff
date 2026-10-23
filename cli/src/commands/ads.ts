@@ -1,4 +1,3 @@
-import { useChatStore } from '../state/chat-store'
 import { useMessageBlockStore } from '../state/message-block-store'
 import { IS_FREEBUFF } from '../utils/constants'
 import { logger } from '../utils/logger'
@@ -9,7 +8,6 @@ import { getAuthToken } from '../utils/auth'
 import { setSponsoredProposalPrefs } from '../utils/sponsored-proposal-api'
 import { runSponsoredProposalControl } from '../utils/sponsored-proposal-control'
 import { sponsoredCliUnavailableCopy } from '../utils/sponsored-availability'
-import { currentSponsoredRun } from '../utils/sponsored-run'
 import { isSponsoredProposalBlock } from '../types/chat'
 
 import type { ChatMessage, SponsoredProposalContentBlock } from '../types/chat'
@@ -31,11 +29,43 @@ export const handleAdsEnable = (): {
   }
 }
 
-export const handleAdsDisable = (): {
+/**
+ * What `/ads:disable` says in Freebuff, where it cannot do what it names.
+ *
+ * The rail is part of free mode's price: `getAdsEnabled()` below returns true
+ * unconditionally on this binary, so there is no state this command could
+ * write that the free client would read. Persisting `adsEnabled: false` anyway
+ * was worse than useless -- the SAME settings file is read by Codebuff LITE,
+ * which is a paid mode where that key DOES turn ads off, so a free user's
+ * dead switch quietly preselected an ad-free paid session later. The command
+ * stays reachable (a discoverable answer beats a missing command); only the
+ * claim that it worked is gone.
+ */
+export const FREEBUFF_ADS_FIXED_COPY =
+  'Ads cannot be turned off in Freebuff - they pay for the free sessions. ' +
+  'This switch applies only to the Codebuff client.'
+
+export const handleAdsDisable = (
+  deps: {
+    /** Pinned for tests only; production reads the build constant. */
+    isFreebuff?: boolean
+    save?: typeof saveSettings
+  } = {},
+): {
   postUserMessage: (messages: ChatMessage[]) => ChatMessage[]
 } => {
+  if (deps.isFreebuff ?? IS_FREEBUFF) {
+    logger.info('[gravity] Ads: disable refused (free mode has no ad switch)')
+    return {
+      postUserMessage: (messages) => [
+        ...messages,
+        getSystemMessage(FREEBUFF_ADS_FIXED_COPY),
+      ],
+    }
+  }
+
   logger.info('[gravity] Disabling ads')
-  saveSettings({ adsEnabled: false })
+  ;(deps.save ?? saveSettings)({ adsEnabled: false })
 
   return {
     postUserMessage: (messages) => [
@@ -140,20 +170,17 @@ export function handleProposalDismiss(messages: ChatMessage[]): string | null {
 
 export const handleProposalReport = (
   messages: ChatMessage[],
-): Promise<string> =>
-  withProposal(
-    messages,
-    (block, authToken) =>
-      runSponsoredProposalControl(
-        'report',
-        {
-          proposalId: block.proposal._id,
-          advertiserId: block.proposal.advertiser_id,
-        },
-        authToken,
-      ),
-    'Reported. Thanks — we review every report.',
-  )
+  getToken = getAuthToken,
+): string | null => {
+  const block = liveSponsoredProposal(messages)
+  if (!block) return 'No sponsored proposal on screen.'
+  if (block.refreshUnavailable) return proposalRefreshUnavailableMessage()
+  if (!getToken()) return 'Sign in to report this sponsored proposal.'
+  useMessageBlockStore
+    .getState()
+    .callbacks.onSponsoredProposalControl(block.target, 'report')
+  return null
+}
 
 export const handleProposalNeverAdvertiser = (
   messages: ChatMessage[],
@@ -176,13 +203,12 @@ export const handleProposalNeverAdvertiser = (
   )
 
 /**
- * `/ads:accept-proposal` — open the consent screen for the card on screen.
+ * `/ads:accept-proposal` — open the consent screen for the offer in the dock.
  *
- * IT STARTS NOTHING. The command is the gesture; the consent is the decision,
- * and only the consent can approve a run (COD-336 item 4, adapted for a
- * terminal in `utils/sponsored-run.ts`). Returns null when it opened one,
- * because a system line saying "opened" would push the screen it refers to
- * further up the transcript.
+ * IT STARTS NOTHING. The command is the gesture, as the dock's `Set it up`
+ * button and its menu item are; the consent is the decision, and only the
+ * consent can approve a run (COD-336 item 4, adapted for a terminal in
+ * `utils/sponsored-run.ts`). Returns null when it opened one.
  */
 export function handleProposalAccept(messages: ChatMessage[]): string | null {
   const block = liveSponsoredProposal(messages)
@@ -204,37 +230,17 @@ function proposalRefreshUnavailableMessage(): string {
 }
 
 /**
- * `/ads:pull-request` — turn the run's branch into a pull request.
+ * `/ads:undo` — put back the files the last sponsored task changed.
  *
- * THE ONLY PUSH IN THE WHOLE FLOW, and it happens here rather than inside the
- * run. `createPullRequest` recomputes `committed` from git and verifies the
- * worktree still points at this repository before either command runs, so this
- * function is a thin front on those guards and never a second opinion about
- * whether a push is safe.
+ * The in-place run's whole recovery story (#3989): it edits the working copy,
+ * commits nothing, and this reverse-applies its edit receipts, skipping any
+ * file changed since rather than clobbering it. Works after a restart, from
+ * the receipts on disk. Goes through the SAME callback as the dock's Undo, so
+ * the brief to the conversation's agent and the transcript line have one
+ * implementation.
  */
-export async function handleProposalPullRequest(): Promise<string> {
-  const run = currentSponsoredRun()
-  if (!run) return 'No sponsored task has run in this session.'
-  const outcome = await run.createPullRequest()
-  if (!outcome.ok) return outcome.message
-  return outcome.recorded
-    ? `Opened ${outcome.prUrl}`
-    : `Opened ${outcome.prUrl} — Freebuff could not be told about it, which changes nothing about the pull request.`
-}
-
-/**
- * `/ads:remove-worktree` — discard the workspace a run left behind.
- *
- * Named in the interrupt notice as well as here, because an interrupted run is
- * the moment a user most wants it and the moment they are least likely to go
- * looking for a command. The run's commits do NOT survive this: the branch goes
- * with the worktree.
- */
-export async function handleProposalRemoveWorktree(): Promise<string> {
-  const run = currentSponsoredRun()
-  if (!run) return 'No sponsored task has run in this session.'
-  const outcome = await run.removeWorktree()
-  return outcome.ok ? outcome.message : outcome.message
+export function handleProposalUndo(): void {
+  useMessageBlockStore.getState().callbacks.onSponsoredProposalUndo()
 }
 
 /**

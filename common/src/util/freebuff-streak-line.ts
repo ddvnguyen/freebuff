@@ -1,3 +1,4 @@
+import { formatHoursWithUnit } from './freebuff-hours'
 import { FREEBUFF_STREAK_REWARDS_ENABLED } from '../constants/freebuff-models'
 import {
   getFreebuffStreakGlmWeeklyUnits,
@@ -63,19 +64,18 @@ export function getFreebuffStreakLine(
   }
 }
 
-/** The perk a 7+ day streak pays, as copy: Freebucks on the meter (every
- *  day, into the wallet), sessions off it. */
+/** The perk a 7+ day streak pays, as copy: Freebucks on the meter (added to
+ *  each day's allowance, gone at its reset), sessions off it. */
 function getFreebuffStreakPerk(params: {
   streak: number
   accessTier: 'full' | 'limited'
   freebucksDailyBonus?: number | null
 }): string {
   if (params.freebucksDailyBonus != null && params.freebucksDailyBonus > 0) {
-    // Streak days are Pacific (`FREEBUFF_STREAK_TIME_ZONE`), while the daily
-    // pool the user watches resets on THEIR clock. East of Pacific one local
-    // day spans a Pacific midnight, so two credits can land the same local
-    // day and read as a double pay; naming the clock is the whole fix.
-    return `+${params.freebucksDailyBonus} Freebucks every Pacific day`
+    // One short line on purpose (2026-10-18). The longer "to your daily
+    // allowance with each day's first message", followed by a status line on
+    // when today's bonus landed and expires, read as a paragraph.
+    return `+${formatHoursWithUnit(params.freebucksDailyBonus)} every day`
   }
   // Only advertise GLM when the recurring full-access streak entitlement is
   // active, so the copy never promises a perk the gate won't honor.
@@ -104,10 +104,11 @@ function getFreebuffStreakPerk(params: {
  * lives in the referral banner; this line is the motivational why. GLM is
  * full-access only, so limited users get the daily session bonus alone.
  *
- * On the Freebucks meter none of that buys anything, and the streak pays
- * `freebucksDailyBonus` Freebucks a day instead (both tiers); the server says
- * which applies through the streak response, so the copy never promises a
- * currency the ledger will not credit.
+ * On the Freebucks meter none of that buys anything, and the streak adds
+ * `freebucksDailyBonus` Freebucks to each streak day's allowance instead (both
+ * tiers; it expires with the allowance, never reaching the wallet); the server
+ * says which applies through the streak response, so the copy never promises
+ * a currency the meter will not grant.
  */
 export function getFreebuffStreakBonusNote(params: {
   streak: number

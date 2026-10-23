@@ -5,7 +5,7 @@ import { join } from 'node:path'
 
 import { sponsoredCliCapability } from '../sponsored-cli-capability'
 
-import type { GitRunner } from '../sponsored-worktree'
+import type { GitRunner } from '../sponsored-git'
 import type { SponsoredLocalContainment } from '@codebuff/common/ads/sponsored-local-execution'
 
 const roots: string[] = []
@@ -103,7 +103,11 @@ describe('sponsoredCliCapability', () => {
         workspaceId: '00000000-0000-4000-8000-000000000000',
       },
       framework: 'react-vite',
-      execution: { surface: 'cli_linux', status: 'available' },
+      execution: {
+        surface: 'cli_linux',
+        status: 'available',
+        outboundNetwork: true,
+      },
     })
   })
 

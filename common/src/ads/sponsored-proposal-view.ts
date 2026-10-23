@@ -1,4 +1,17 @@
+import {
+  formatSponsoredStepCount,
+  sponsoredDoneStepCount,
+} from './sponsored-procedure-steps'
 import { sanitizeAdUrl } from '../util/ad-creative-safety'
+import {
+  sponsoredOfferPlanFromWire,
+  sponsoredOfferSummary,
+} from './sponsored-offer-plan'
+
+import type {
+  SponsoredOfferPlan,
+  SponsoredOfferPlanWire,
+} from './sponsored-offer-plan'
 
 /**
  * Sponsored proposals — the channel logic, with no surface attached.
@@ -42,21 +55,33 @@ export type SponsoredProposalState =
   // own branch and stopped. `landed` still means a pull request EXISTS, and
   // only the user's own "Create pull request" moves a row there.
   | 'committed'
+  // Terminal, and the ordinary success of an IN-PLACE run (the 2026-09-24
+  // amendment in `docs/freebuff-sponsored-local-execution.md`): the edits are
+  // in the user's working copy. There is no branch, so nothing reaches
+  // `landed` or `merged` from here, and the review is the changes panel.
+  | 'delivered'
   | 'landed'
   | 'failed'
   | 'merged'
 
+// Plain words for what is happening to the user's project, never our name for
+// the mechanism. The "Sponsored" disclosure belongs to each surface's own
+// chrome, so the titles do not repeat it.
 export const SPONSORED_STATE_TITLE: Record<SponsoredProposalState, string> = {
-  offered: 'Sponsored proposal',
-  accepted: 'Starting sponsored thread…',
-  running: 'Sponsored thread running',
+  offered: 'Sponsored offer',
+  accepted: 'Getting started…',
+  running: 'Setting it up…',
   // Names the OUTCOME, not a next step. The run is finished and the commits
   // are on a branch; whether that becomes a pull request is the user's call,
   // so the copy must not read as though something is still pending.
-  committed: 'Sponsored thread committed its work',
-  landed: 'Sponsored thread landed a PR',
-  failed: 'Sponsored thread failed',
-  merged: 'Sponsored PR merged',
+  committed: 'Done — committed to its own branch',
+  // Says WHERE the work is, because that is the one thing a user needs to
+  // know here and it is different from every other terminal: the files in
+  // front of them have already changed.
+  delivered: 'Done — the changes are in your files',
+  landed: 'Done — pull request opened',
+  failed: 'Couldn’t finish the setup',
+  merged: 'Done — pull request merged',
 }
 
 /**
@@ -76,6 +101,7 @@ export const SPONSORED_STATE_IS_TERMINAL: Record<
   accepted: false,
   running: false,
   committed: true,
+  delivered: true,
   landed: true,
   failed: true,
   merged: true,
@@ -98,7 +124,7 @@ export const SPONSORED_STATE_IS_TERMINAL: Record<
  * row still reads `offered` while a run is very much in flight. Keying purely
  * on the state would therefore stop watching at exactly the moment watching
  * starts to matter, which is the bug this exists to close: a run that failed
- * left the card showing `offered` with a live "Start sponsored thread" button
+ * left the card showing `offered` with a live Accept button
  * on it, and a second Accept aimed at a proposal that was already dead.
  */
 export function sponsoredProposalAwaitsVerdict(
@@ -109,7 +135,29 @@ export function sponsoredProposalAwaitsVerdict(
   return runStarted || state !== 'offered'
 }
 
-export type SponsoredProposalStepState = 'pending' | 'active' | 'done'
+/**
+ * `needs_you` is a step the run cannot finish without the user: a sign-in, an
+ * API key, a CLI login approval (COD-828). The run waits on it, without a
+ * timer of its own, until the user answers or the grant's deadline passes.
+ */
+export const SPONSORED_PROPOSAL_STEP_STATES = [
+  'pending',
+  'active',
+  'needs_you',
+  'done',
+] as const
+
+export type SponsoredProposalStepState =
+  (typeof SPONSORED_PROPOSAL_STEP_STATES)[number]
+
+export function isSponsoredProposalStepState(
+  value: unknown,
+): value is SponsoredProposalStepState {
+  return (
+    typeof value === 'string' &&
+    (SPONSORED_PROPOSAL_STEP_STATES as readonly string[]).includes(value)
+  )
+}
 
 export type SponsoredProposalStep = {
   text: string
@@ -124,7 +172,28 @@ export const SPONSORED_STEP_STATE_LABEL: Record<
 > = {
   pending: 'Pending',
   active: 'In progress',
+  needs_you: 'Needs you',
   done: 'Done',
+}
+
+/**
+ * The steps as they read while the run is waiting on the user (COD-828): the
+ * step in progress becomes `needs_you`, or the first pending one when nothing
+ * is in progress yet. Steps already marked stay as they are, and a run that
+ * is not waiting gets its steps back unchanged.
+ */
+export function sponsoredStepsNeedingYou(
+  steps: readonly SponsoredProposalStep[],
+  needsYou: boolean,
+): SponsoredProposalStep[] {
+  if (!needsYou || steps.some((step) => step.state === 'needs_you'))
+    return [...steps]
+  const at = steps.findIndex((step) => step.state === 'active')
+  const index =
+    at >= 0 ? at : steps.findIndex((step) => step.state === 'pending')
+  return steps.map((step, i) =>
+    i === index ? { ...step, state: 'needs_you' } : step,
+  )
 }
 
 /**
@@ -152,6 +221,13 @@ export type SponsoredProposalRow = {
   body: string
   why_this?: string
   steps?: SponsoredProposalStep[]
+  /**
+   * What the reviewed procedure will ask of the user, said before Accept
+   * (COD-824): step count, time estimate, the steps that need them. Attached
+   * by the off-Cloud read route, never stored on the row; absent on Web and
+   * whenever the route could not compose it. Re-validated on render.
+   */
+  offer_plan?: SponsoredOfferPlanWire
   /**
    * The sponsored thread, so a terminal card can offer the read-only view
    * (COD-258). Absent before the proposal is accepted.
@@ -191,6 +267,32 @@ export type SponsoredProposalRow = {
     missing?: string[]
   }
   acceptance_criteria_sha256?: string
+  /**
+   * The user closed this card after accepting it, and its run is still in
+   * flight (COD-665). Set only by the server projection, which drops a
+   * hidden row once its run has ended; see `sponsoredProposalMinimized`.
+   */
+  hidden?: true
+}
+
+/**
+ * Whether a surface draws this card MINIMIZED instead of in full (COD-665).
+ *
+ * The X on an accepted card HIDES it and never touches the run: the run
+ * state is the executor's and the reporting surface's from Accept onwards.
+ * But a live run is not concealed either -- the card is the one place that
+ * says something is working on the user's code -- so while the row is
+ * `accepted` or `running` a hidden card shrinks to a line the user can
+ * reopen, and it leaves the panel only when the server stops returning it
+ * (its run ended). A hidden row in any other state is not expected here;
+ * it is drawn in full rather than guessed at.
+ */
+export function sponsoredProposalMinimized(
+  row: Pick<SponsoredProposalRow, 'state' | 'hidden'>,
+): boolean {
+  return (
+    row.hidden === true && (row.state === 'accepted' || row.state === 'running')
+  )
 }
 
 /**
@@ -207,6 +309,11 @@ export type SponsoredProposalActionKind =
   | 'create-pull-request'
   | 'view-run'
   | 'open-pull-request'
+  // The two answers to a `delivered` card, and the reason it needs neither of
+  // the PR actions: the work is already in the user's files, so reviewing it
+  // is reading the diff and rejecting it is putting the files back.
+  | 'review-changes'
+  | 'undo-changes'
   // The advertiser's own next step, once there is a diff to take it with
   // (COD-512). Carries the conversion token the advertiser's postback
   // verifies; the label is neutral by design, the advertiser's name is the
@@ -375,7 +482,7 @@ export function sponsoredLogoSrc(token: string | undefined): string | null {
 const DEFAULT_WHY_THIS =
   'Matched to what you are building in this project. Sponsored proposals never read your code without your go-ahead.'
 const DEFAULT_FAILURE_REASON =
-  'The sponsored thread could not finish. Nothing was changed in your project.'
+  'The setup couldn’t finish. Nothing was changed in your project.'
 
 /** Guidance, not activation evidence. A finished run proves only local work;
  * neither a signup link nor a merged PR proves the service works. Keep this
@@ -423,6 +530,15 @@ export type SponsoredProposalViewModel = {
   branch: string | null
   steps: SponsoredProposalStep[]
   doneStepCount: number
+  /** "3/8" ({@link formatSponsoredStepCount}); null with no steps. */
+  stepCountLabel: string | null
+  /** The validated `offer_plan`, or null. Feeds `sponsoredProgressPill`. */
+  offerPlan: SponsoredOfferPlan | null
+  /**
+   * "6 steps · ~4 min · 1 needs you (Archil account)", on `offered` only, or
+   * null when there is no plan to say it from.
+   */
+  offerSummary: string | null
   logoToken: string | null
   logoSrc: string | null
   pullRequestHref: string | null
@@ -431,7 +547,6 @@ export type SponsoredProposalViewModel = {
    * (`committed` onwards), and null whenever the row carries no settled CTA.
    */
   advertiserCtaHref: string | null
-  setupExpectation: string
   setupGuide: SponsoredSetupGuide | null
   verification: SponsoredVerificationPanel | null
   actions: SponsoredProposalAction[]
@@ -449,14 +564,21 @@ export function sponsoredProposalViewModel(
   row: SponsoredProposalRow,
 ): SponsoredProposalViewModel {
   const steps = row.steps ?? []
+  const offerPlan = sponsoredOfferPlanFromWire(row.offer_plan)
   const pullRequestHref = sponsoredPullRequestHref(row.pr_url)
   const logoToken = sponsoredLogoToken(row.advertiser_logo_token)
-  // Only once there is a committed diff to go with it: the CTA is the
-  // advertiser's "now set up your account" and before `committed` there is
-  // nothing to set it up for. `landed` and `merged` are the same finished run
-  // further on. Never on `failed` -- the settlement may have charged, but the
-  // card is telling the user nothing changed and must not sell beside that.
-  const ctaStates: SponsoredProposalState[] = ['committed', 'landed', 'merged']
+  // Only once there is a diff to go with it: the CTA is the advertiser's "now
+  // set up your account" and before the work exists there is nothing to set it
+  // up for. `landed` and `merged` are the same finished run further on, and
+  // `delivered` is the same finished run without a commit. Never on `failed`
+  // -- the settlement may have charged, but the card is telling the user
+  // nothing changed and must not sell beside that.
+  const ctaStates: SponsoredProposalState[] = [
+    'committed',
+    'delivered',
+    'landed',
+    'merged',
+  ]
   const advertiserCtaHref = ctaStates.includes(row.state)
     ? sponsoredAdvertiserCtaHref(row.advertiser_cta_url)
     : null
@@ -522,10 +644,10 @@ export function sponsoredProposalViewModel(
 
   const stateActions: SponsoredProposalAction[] = (() => {
     switch (row.state) {
+      // No cost claim here: whether the run is free to the user differs by
+      // surface, so each surface's own copy says that.
       case 'offered':
-        return [
-          { kind: 'accept', label: 'Start sponsored thread', primary: true },
-        ]
+        return [{ kind: 'accept', label: 'Set it up for me', primary: true }]
       case 'running':
         return viewRun('Watch this run')
       case 'committed':
@@ -536,6 +658,24 @@ export function sponsoredProposalViewModel(
             primary: true,
           },
           ...viewRun('View what it did'),
+          ...openAdvertiser(),
+          ...verifyAgain(),
+        ]
+      // REVIEW LEADS, and it is the diff rather than a run transcript: the
+      // files in front of the user have changed, so the first thing offered is
+      // seeing exactly what changed. Undo is beside it and NOT destructive in
+      // the menu sense -- it puts the user's files back, which is the opposite
+      // of a control that turns something off for good. No `view-run`: the run
+      // happened in this very conversation, so the transcript is already on
+      // screen and a link to it would point at itself.
+      case 'delivered':
+        return [
+          {
+            kind: 'review-changes',
+            label: 'Review the changes',
+            primary: true,
+          },
+          { kind: 'undo-changes', label: 'Undo these changes' },
           ...openAdvertiser(),
           ...verifyAgain(),
         ]
@@ -573,16 +713,29 @@ export function sponsoredProposalViewModel(
     failureReason: row.failure_reason || DEFAULT_FAILURE_REASON,
     branch: row.branch || null,
     steps,
-    doneStepCount: steps.filter((step) => step.state === 'done').length,
+    doneStepCount: sponsoredDoneStepCount(steps),
+    stepCountLabel: formatSponsoredStepCount(
+      sponsoredDoneStepCount(steps),
+      steps.length,
+    ),
+    offerPlan,
+    offerSummary:
+      row.state === 'offered' ? sponsoredOfferSummary(offerPlan) : null,
     logoToken,
     logoSrc: sponsoredLogoSrc(row.advertiser_logo_token),
     pullRequestHref,
     advertiserCtaHref,
-    setupExpectation: 'Account setup may be needed after the code is ready.',
     setupGuide: ctaStates.includes(row.state)
       ? {
           title: 'Finish setup and verify',
-          eyebrow: row.state === 'merged' ? 'Finish setup' : 'Before you merge',
+          eyebrow:
+            row.state === 'merged'
+              ? 'Finish setup'
+              : // Nothing is merged on an in-place run, so "Before you merge"
+                // would name a step that does not exist here.
+                row.state === 'delivered'
+                ? 'Before you keep it'
+                : 'Before you merge',
           heading: `Connect ${row.advertiser_name}`,
           description:
             'Your code is ready. Create an account or sign in, then add your project settings.',

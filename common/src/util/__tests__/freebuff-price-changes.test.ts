@@ -1,8 +1,8 @@
 import { describe, expect, it, test, spyOn } from 'bun:test'
 import { freebucksFixture } from '../../testing/freebuff'
-import { applyFirstTabDiscount } from '../freebuff-first-tab-discount'
 import {
   SOLAR_PRICE_CHANGES,
+  SOLAR_PROMOTIONAL,
   SOLAR_REGULAR_OFFER,
 } from '../../constants/freebuff-solar-promo'
 import {
@@ -17,10 +17,12 @@ const end = Date.parse('2026-09-08T07:00:00Z')
 const restored = Date.parse('2026-09-09T15:49:00Z')
 const metered = Date.parse('2026-09-13T05:00:00Z')
 const increased = Date.parse('2026-09-14T03:46:00Z')
+const returned = Date.parse('2026-09-25T19:00:00Z')
+const promoted = Date.parse('2026-10-05T07:15:00Z')
 const quoteBeforeStart = () => ({
   ...freebucksFixture(0, { [solar]: SOLAR_REGULAR_OFFER.price }),
   priceNotices: { [solar]: SOLAR_REGULAR_OFFER.tagline },
-  priceChanges: [...SOLAR_PRICE_CHANGES],
+  priceChanges: SOLAR_PRICE_CHANGES.filter((c) => c.modelId === solar),
 })
 
 describe('announced Freebucks price changes', () => {
@@ -40,7 +42,7 @@ describe('announced Freebucks price changes', () => {
     expect(nextFreebucksPriceChange(expired)).toBe(restored)
     const freeAgain = applyFreebucksPriceChanges(expired, restored)
     expect(freeAgain.prices[solar]).toBe(0)
-    expect(freeAgain.priceNotices[solar]).toBe('0 Freebucks')
+    expect(freeAgain.priceNotices[solar]).toBe('Free')
     expect(nextFreebucksPriceChange(freeAgain)).toBe(metered)
     const meteredAgain = applyFreebucksPriceChanges(freeAgain, metered)
     expect(meteredAgain.prices[solar]).toBe(5)
@@ -49,13 +51,48 @@ describe('announced Freebucks price changes', () => {
     expect(applyFreebucksPriceChanges(meteredAgain, increased - 1)).toBe(
       meteredAgain,
     )
-    expect(applyFreebucksPriceChanges(meteredAgain, increased)).toEqual({
-      ...meteredAgain,
-      prices: { ...meteredAgain.prices, [solar]: 10 },
-      priceChanges: [],
+    const increasedQuote = applyFreebucksPriceChanges(meteredAgain, increased)
+    expect(increasedQuote.prices[solar]).toBe(10)
+    expect(increasedQuote.priceNotices[solar]).toBe('Limited-time trial')
+    expect(nextFreebucksPriceChange(increasedQuote)).toBe(returned)
+    // The return to the pickers keeps the price and replaces only the copy.
+    const returnedQuote = applyFreebucksPriceChanges(increasedQuote, returned)
+    expect(returnedQuote).toEqual({
+      ...increasedQuote,
+      priceNotices: { ...increasedQuote.priceNotices, [solar]: 'Upstage flagship' },
+      priceChanges: [expect.objectContaining({ at: '2026-10-05T07:15:00Z' })],
     })
+    expect(nextFreebucksPriceChange(returnedQuote)).toBe(promoted)
+    const promotedQuote = applyFreebucksPriceChanges(returnedQuote, promoted)
+    expect(promotedQuote.prices[solar]).toBe(0)
+    expect(promotedQuote.priceNotices[solar]).toBe('Promotional')
+    expect(promotedQuote.priceChanges).toEqual([])
     expect(quote.prices[solar]).toBe(5)
-    expect(quote.priceChanges).toHaveLength(5)
+    expect(quote.priceChanges).toHaveLength(7)
+  })
+
+  it("applies Solar Mini 4's promotion to Mini's row only", () => {
+    const mini = 'upstage/solar-mini4'
+    const quote = {
+      ...freebucksFixture(0, { [solar]: 10, [mini]: 5 }),
+      priceNotices: { [solar]: 'Upstage flagship', [mini]: 'Fast and light' },
+      priceChanges: SOLAR_PRICE_CHANGES.filter((c) => c.modelId === mini),
+    }
+    const free = applyFreebucksPriceChanges(quote, Date.parse('2026-10-02T18:00:00Z'))
+    expect(free.prices).toEqual({ [solar]: 10, [mini]: 0 })
+    expect(free.priceNotices[mini]).toBe('Free through Sunday, Oct 4 PT')
+    const ended = Date.parse('2026-10-05T07:00:00Z')
+    expect(nextFreebucksPriceChange(free)).toBe(ended)
+    const back = applyFreebucksPriceChanges(free, ended)
+    expect(back.prices).toEqual({ [solar]: 10, [mini]: 5 })
+    expect(back.priceNotices[mini]).toBe('Fast and light')
+    // Then free again, open-ended, from 2026-10-08.
+    const promo = Date.parse('2026-10-08T21:30:00Z')
+    expect(nextFreebucksPriceChange(back)).toBe(promo)
+    const promoted = applyFreebucksPriceChanges(back, promo)
+    expect(promoted.prices).toEqual({ [solar]: 10, [mini]: 0 })
+    expect(promoted.priceNotices[mini]).toBe(SOLAR_PROMOTIONAL.short)
+    expect(promoted.priceChanges).toEqual([])
   })
 
   it('catches up across all transitions, even when a delayed response lists them out of order', () => {
@@ -128,15 +165,6 @@ describe('recurring server prices', () => {
       expect(quote.prices.flash).toBe(stale)
       expect(applyFreebucksPriceChanges(current, now)).toBe(current)
       expect(nextFreebucksPriceChange(current, now)).toBe(Date.parse(next))
-      const discounted = applyFirstTabDiscount(quote, { amount: 10, available: true })
-      const firstTab = applyFreebucksPriceChanges(discounted, now)
-      expect(firstTab.prices.flash).toBe(price - 10)
-      expect(firstTab.listPrices?.flash).toBe(price)
-      expect(discounted.listPrices?.flash).toBe(stale)
-      expect(applyFreebucksPriceChanges(firstTab, now)).toBe(firstTab)
-      expect(applyFirstTabDiscount(firstTab, { amount: 10, available: false }).prices.flash).toBe(price)
-      // A stale crossed-out price still needs repair when the payable price is current.
-      expect(applyFreebucksPriceChanges({ ...firstTab, listPrices: { flash: stale } }, now).listPrices?.flash).toBe(price)
     },
   )
 

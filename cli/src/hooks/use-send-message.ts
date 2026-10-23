@@ -1,3 +1,8 @@
+import {
+  freebuffChatNeedsAdmission,
+  requestFreebuffChatAdmission,
+} from '../state/freebuff-chat-store'
+import { capturePendingAttachments } from '../utils/pending-attachments'
 import { randomUUID } from 'node:crypto'
 
 import { useCallback, useEffect, useRef } from 'react'
@@ -5,22 +10,30 @@ import { useCallback, useEffect, useRef } from 'react'
 import { setCurrentChatId } from '../project-files'
 import { createStreamController } from './stream-state'
 import { useChatStore } from '../state/chat-store'
+import { getFreebuffInstanceId } from './use-freebuff-session'
 import {
-  getFreebuffInstanceId,
-  markFreebuffSessionEnded,
-} from './use-freebuff-session'
-import { getSelectedFreebuffReasoningEffort } from '../state/freebuff-model-store'
+  getSelectedFreebuffReasoningEffort,
+  getSelectedFreebuffModel,
+} from '../state/freebuff-model-store'
 import { getCodebuffClient } from '../utils/codebuff-client'
 import {
+  byokLoadFailureMessage,
   isByokSetupOpen,
   resolveByokConnection,
   selectedByokConnection,
 } from '../utils/byok'
 import { AGENT_MODE_TO_COST_MODE, IS_FREEBUFF } from '../utils/constants'
 import { createEventHandlerState } from '../utils/create-event-handler-state'
+import { captureCliFunnel, cliFunnelKey } from '../utils/cli-product-funnel'
+import { createCliRunFunnel } from '../utils/cli-run-funnel'
 import { createRunConfig } from '../utils/create-run-config'
 import { getAgentIdForMode } from '../utils/freebuff-agent-selection'
+import {
+  clientDescriptorMetadata,
+  freebuffSessionMetadata,
+} from '../utils/freebuff-session-identity'
 import { loadAgentDefinitions } from '../utils/local-agent-registry'
+import { runWithFreebuffCatalogStaleRetry } from '../utils/freebuff-model-catalog'
 import { logger } from '../utils/logger'
 import { clearActiveRun, registerActiveRun } from '../utils/active-run'
 import {
@@ -40,6 +53,8 @@ import {
   sanitizeRestoredMessages,
 } from '../utils/send-message-helpers'
 import { createSendMessageTimerController } from '../utils/send-message-timer'
+import { takePendingSponsoredBrief } from '../utils/sponsored-brief'
+import { withSponsoredModelEventTap } from '../utils/sponsored-run'
 import {
   activateSteering,
   deactivateSteering,
@@ -52,14 +67,16 @@ import {
   resetEarlyReturnState,
   setupStreamingContext,
 } from './helpers/send-message'
-import { NETWORK_ERROR_ID } from '../utils/validation-error-helpers'
 import { yieldToEventLoop } from '../utils/yield-to-event-loop'
 
 import type { ElapsedTimeTracker } from './use-elapsed-time'
 import type { StreamStatus } from './use-message-queue'
 import type { PendingAttachment } from '../types/store'
 import type { ChatMessage } from '../types/chat'
-import type { SendMessageFn } from '../types/contracts/send-message'
+import type {
+  SendMessageFn,
+  SponsoredSend,
+} from '../types/contracts/send-message'
 import type { AgentMode } from '../utils/constants'
 import type { SendMessageTimerEvent } from '../utils/send-message-timer'
 import { STATE_SNAPSHOT_INTERRUPTION_MESSAGE } from '@codebuff/sdk'
@@ -287,7 +304,7 @@ export const useSendMessage = ({
   )
 
   const sendMessage = useCallback<SendMessageFn>(
-    async ({ content, agentMode, postUserMessage, attachments }) => {
+    async ({ content, agentMode, postUserMessage, attachments, sponsored }) => {
       // CRITICAL: Set chain in progress immediately (synchronously) before any async work.
       // This ensures the router can detect that we're busy and queue subsequent messages.
       // Set the ref directly first to guarantee immediate visibility to other code paths,
@@ -296,22 +313,37 @@ export const useSendMessage = ({
       updateChainInProgress(true)
       setCanProcessQueue(false)
 
+      // A sponsored turn is paid by the sponsor's grant and never by the
+      // user's own source: no BYOK connection, and no Freebuff session.
+      let sponsoredErrorText: string | null = null
+      let sponsoredSettled = false
+      const settleSponsored = (aborted: boolean) => {
+        if (!sponsored || sponsoredSettled) return
+        sponsoredSettled = true
+        sponsored.onSettled({ errorText: sponsoredErrorText, aborted })
+      }
+
       // Snapshot the source before any await. A selected connection always
       // runs directly and must never attempt Freebuff session admission.
-      const selectedByok = IS_FREEBUFF ? selectedByokConnection() : undefined
+      const selectedByok =
+        IS_FREEBUFF && !sponsored ? selectedByokConnection() : undefined
       const shouldUseByok = selectedByok !== undefined
 
-      // Freebuff run-start guard: without a live session slot the server
-      // rejects the request outright, consuming the message. Hold it at the
-      // head of the queue instead; it resumes when the user rejoins from the
-      // session-ended banner. Catches sends that bypass the queue's
-      // sendBlocked hold (direct review-screen answers) and the dequeue race
-      // where the slot expires between the queue's check and this call.
-      if (IS_FREEBUFF && !shouldUseByok && !getFreebuffInstanceId()) {
-        // During BYOK setup there is no session to end; marking it would swap
-        // the setup chat for the session-ended banner.
-        if (!isByokSetupOpen()) markFreebuffSessionEnded()
-        requeueMessageAtFront?.({ content, attachments: attachments ?? [] })
+      // Preserve the submitted text and attachments until send-time admission
+      // (and any wallet/model-switch consent) finishes. The persistent runtime
+      // holds the queue until this model has a live session.
+      if (
+        IS_FREEBUFF &&
+        !shouldUseByok &&
+        !sponsored &&
+        freebuffChatNeedsAdmission()
+      ) {
+        // BYOK setup must never purchase a Freebuff session.
+        if (!isByokSetupOpen()) requestFreebuffChatAdmission()
+        requeueMessageAtFront?.({
+          content,
+          attachments: attachments ?? capturePendingAttachments(),
+        })
         resetEarlyReturnState({
           setCanProcessQueue,
           updateChainInProgress,
@@ -337,7 +369,34 @@ export const useSendMessage = ({
       // context switch during attachment processing, validation, or client
       // creation had no controller to stop.
       const runOwnerId = randomUUID()
+      const funnelDetails = {
+        run_id: runOwnerId,
+        thread_id: cliFunnelKey(useChatStore.getState().chatSessionId),
+        model: shouldUseByok ? 'byok' : getSelectedFreebuffModel(),
+        harness: 'codebuff' as const,
+        has_attachments:
+          (attachments?.length ??
+            useChatStore.getState().pendingAttachments.length) > 0,
+        character_count: Math.min(content.length, 10_000_000),
+      }
+      const runFunnel = createCliRunFunnel({
+        capture: (stage, state, details) => {
+          // Sponsored work and its generated followups never count as conversion.
+          if (!sponsored) {
+            if (stage === 'send' && state === 'accepted')
+              captureCliFunnel('model_selection', 'applied', funnelDetails)
+            captureCliFunnel(stage, state, { ...funnelDetails, ...details })
+          }
+        },
+      })
       const abortController = new AbortController()
+      abortController.signal.addEventListener(
+        'abort',
+        () => runFunnel.cancel(),
+        {
+          once: true,
+        },
+      )
       const runChatDir = resolveCurrentChatDir()
       const runChatIsCurrent = () => resolveCurrentChatDir() === runChatDir
       let latestRunStateSnapshot: RunState = previousRunStateRef.current ?? {
@@ -383,9 +442,20 @@ export const useSendMessage = ({
         )
       })
 
+      // The sponsor's own interrupt (the grant expiring, or the CLI exiting)
+      // stops this run exactly as Esc would.
+      if (sponsored) {
+        const stop = () =>
+          abortController.abort(sponsored.plan.signal.reason ?? 'sponsored')
+        if (sponsored.plan.signal.aborted) stop()
+        else
+          sponsored.plan.signal.addEventListener('abort', stop, { once: true })
+      }
+
       const releaseIfStopped = (): boolean => {
         if (!abortController.signal.aborted) return false
         releaseRunOwnership()
+        settleSponsored(true)
         return true
       }
 
@@ -397,6 +467,7 @@ export const useSendMessage = ({
           isQueuePausedRef,
         })
         releaseRunOwnership()
+        settleSponsored(false)
       }
 
       // Prepare user message (bash context, images, text attachments, mode divider)
@@ -405,93 +476,113 @@ export const useSendMessage = ({
       let bashContextForPrompt: string | undefined
       let finalContent: string
 
-      try {
-        const prepared = await prepareUserMessage({
-          content,
-          agentMode,
-          postUserMessage,
-          attachments,
-          signal: abortController.signal,
-        })
-        userMessageId = prepared.userMessageId
-        messageContent = prepared.messageContent
-        bashContextForPrompt = prepared.bashContextForPrompt
-        finalContent = prepared.finalContent
-      } catch (error) {
-        if (releaseIfStopped()) return
-        logger.error(
-          { error },
-          '[send-message] prepareUserMessage failed with exception',
-        )
-        setMessages((prev) => [
-          ...prev,
-          createErrorChatMessage(
-            '⚠️ Failed to prepare message. Please try again.',
-          ),
-        ])
-        finishPreflight()
-        return
+      if (sponsored) {
+        // NO USER BUBBLE: the user did not say this. The anchor row marks
+        // where the sponsor's stretch of the conversation begins, and the
+        // prompt is ours plus the advertiser's reviewed procedure.
+        setMessages((prev) => [...prev, sponsored.anchor])
+        userMessageId = sponsored.anchor.id
+        messageContent = undefined
+        bashContextForPrompt = undefined
+        finalContent = sponsored.plan.prompt
+      } else {
+        try {
+          const prepared = await prepareUserMessage({
+            content,
+            agentMode,
+            postUserMessage,
+            attachments,
+            signal: abortController.signal,
+          })
+          userMessageId = prepared.userMessageId
+          messageContent = prepared.messageContent
+          bashContextForPrompt = prepared.bashContextForPrompt
+          finalContent = prepared.finalContent
+        } catch (error) {
+          if (releaseIfStopped()) return
+          logger.error(
+            { error },
+            '[send-message] prepareUserMessage failed with exception',
+          )
+          setMessages((prev) => [
+            ...prev,
+            createErrorChatMessage(
+              '⚠️ Failed to prepare message. Please try again.',
+            ),
+          ])
+          finishPreflight()
+          return
+        }
       }
 
       if (releaseIfStopped()) return
 
-      // Validate before sending (e.g., agent config checks)
-      try {
-        const validationResult = await onBeforeMessageSend()
+      // Validate before sending (e.g., agent config checks). Not for a
+      // sponsored turn: its agent is the pinned sponsored definition, not a
+      // local one this check exists to validate.
+      if (!sponsored)
+        try {
+          const validationResult = await onBeforeMessageSend()
 
-        if (releaseIfStopped()) return
+          if (releaseIfStopped()) return
 
-        if (!validationResult.success) {
-          logger.warn(
-            { errors: validationResult.errors },
-            '[send-message] Validation failed',
+          if (!validationResult.success) {
+            const errorsToAttach =
+              validationResult.errors.length === 0
+                ? [
+                    {
+                      id: 'validation_error',
+                      message:
+                        'The validation check failed without an explanation.',
+                    },
+                  ]
+                : validationResult.errors
+
+            // Error-level telemetry retains details; warnings are summarized.
+            logger.error(
+              { errors: errorsToAttach },
+              '[send-message] Validation failed',
+            )
+            setMessages((prev) => [
+              ...prev.map((msg) => {
+                if (msg.id !== userMessageId) {
+                  return msg
+                }
+                return {
+                  ...msg,
+                  validationErrors: errorsToAttach,
+                }
+              }),
+              createErrorChatMessage(
+                `Message not sent: agent validation failed. ${errorsToAttach[0].message} Check the error and try again.`,
+              ),
+            ])
+            await yieldToEventLoop()
+            if (releaseIfStopped()) return
+            setTimeout(() => scrollToLatest(), 0)
+            finishPreflight()
+            return
+          }
+        } catch (error) {
+          if (releaseIfStopped()) return
+          logger.error(
+            { error },
+            '[send-message] Validation before message send failed with exception',
           )
-          const errorsToAttach =
-            validationResult.errors.length === 0
-              ? [
-                  // Hide this for now, as validate endpoint may be flaky and we don't want to bother users.
-                  // {
-                  //   id: NETWORK_ERROR_ID,
-                  //   message:
-                  //     'Agent validation failed. This may be due to a network issue or temporary server problem. Please try again.',
-                  // },
-                ]
-              : validationResult.errors
 
-          setMessages((prev) =>
-            prev.map((msg) => {
-              if (msg.id !== userMessageId) {
-                return msg
-              }
-              return {
-                ...msg,
-                validationErrors: errorsToAttach,
-              }
-            }),
-          )
+          setMessages((prev) => [
+            ...prev,
+            createErrorChatMessage(
+              '⚠️ Agent validation failed unexpectedly. Please try again.',
+            ),
+          ])
+          await yieldToEventLoop()
+          if (releaseIfStopped()) return
+          setTimeout(() => scrollToLatest(), 0)
+
           finishPreflight()
           return
         }
-      } catch (error) {
-        if (releaseIfStopped()) return
-        logger.error(
-          { error },
-          '[send-message] Validation before message send failed with exception',
-        )
-
-        setMessages((prev) => [
-          ...prev,
-          createErrorChatMessage(
-            '⚠️ Agent validation failed unexpectedly. Please try again.',
-          ),
-        ])
-        await yieldToEventLoop()
-        if (releaseIfStopped()) return
-        setTimeout(() => scrollToLatest(), 0)
-
-        finishPreflight()
-        return
-      }
 
       // Reset UI focus state
       setFocusedAgentId(null)
@@ -502,7 +593,9 @@ export const useSendMessage = ({
       let client: Awaited<ReturnType<typeof getCodebuffClient>>
       let byok: Awaited<ReturnType<typeof resolveByokConnection>> | undefined
       try {
-        byok = selectedByok ? await resolveByokConnection(selectedByok) : undefined
+        byok = selectedByok
+          ? await resolveByokConnection(selectedByok)
+          : undefined
         client = await getClient({ ...(byok ? { byok } : {}) })
       } catch (error) {
         if (releaseIfStopped()) return
@@ -514,7 +607,7 @@ export const useSendMessage = ({
           ...prev,
           createErrorChatMessage(
             shouldUseByok
-              ? '⚠️ Unable to load the selected BYOK connection. Check its credential and select it again.'
+              ? byokLoadFailureMessage(error)
               : '⚠️ Unable to create the client. Please check your authentication and try again.',
           ),
         ])
@@ -587,16 +680,23 @@ export const useSendMessage = ({
 
       // Execute SDK run with streaming handlers
       try {
-        const agentDefinitions = loadAgentDefinitions()
-        const resolvedAgent = resolveAgent(agentMode, agentId, agentDefinitions)
+        // A sponsored turn loads NO local agent definitions: a `.agents/`
+        // definition is repository-authored content a sponsored run has no
+        // business loading, and its agent is the pinned sponsored one.
+        let agentDefinitions = sponsored ? [] : loadAgentDefinitions()
+        let resolvedAgent = sponsored
+          ? sponsored.plan.agent
+          : resolveAgent(agentMode, agentId, agentDefinitions)
 
         const promptWithBashContext = bashContextForPrompt
           ? bashContextForPrompt + finalContent
           : finalContent
-        const effectivePrompt = buildPromptWithContext(
-          promptWithBashContext,
-          messageContent,
-        )
+        // The conversation's own agent is told what a sponsored run did to
+        // the files it remembers, once, on its next turn.
+        const sponsoredBrief = sponsored ? null : takePendingSponsoredBrief()
+        const effectivePrompt = sponsoredBrief
+          ? `${sponsoredBrief}\n\n${buildPromptWithContext(promptWithBashContext, messageContent)}`
+          : buildPromptWithContext(promptWithBashContext, messageContent)
 
         const eventHandlerState = createEventHandlerState({
           isActive: () => !abortController.signal.aborted && runChatIsCurrent(),
@@ -613,6 +713,9 @@ export const useSendMessage = ({
           logger,
           setIsRetrying,
           onTotalCost: (cost: number) => {
+            // The sponsor's grant paid for a sponsored turn; it is not the
+            // user's spend and is not shown as theirs.
+            if (sponsored) return
             actualCredits = cost
             // Only add to session credits if not covered by subscription
             // (subscription credits are shown separately in the UI)
@@ -623,7 +726,7 @@ export const useSendMessage = ({
         })
 
         const freebuffInstanceId = getFreebuffInstanceId()
-        // The user's `/reasoning` pick, when they made one. Read HERE rather
+        // The user's reasoning picker choice, when they made one. Read HERE rather
         // than captured earlier so a mid-session change lands on the very next
         // message without restarting the session. Null means "send nothing",
         // which is what makes the server fall back to the catalog default —
@@ -647,69 +750,120 @@ export const useSendMessage = ({
         const canResumePreviousRun = priorByok
           ? Boolean(
               selectedByok &&
-                priorByok.id === selectedByok.id &&
-                priorByok.revision === selectedByok.revision,
+              priorByok.id === selectedByok.id &&
+              priorByok.revision === selectedByok.revision,
             )
           : !byok
-        const runConfig = createRunConfig({
-          logger,
-          agent: resolvedAgent,
-          prompt: effectivePrompt,
-          content: messageContent,
-          // A persisted run has a non-secret source pin. Never resume its
-          // transcript after switching to Freebuff or another BYOK revision.
-          previousRunState: canResumePreviousRun
-            ? previousRunStateRef.current
-            : null,
-          agentDefinitions,
-          eventHandlerState,
-          signal: abortController.signal,
-          // BYOK never enters the Freebuff free-mode admission or budget path.
-          costMode: byok ? 'normal' : AGENT_MODE_TO_COST_MODE[agentMode],
-          ...(byok ? { byok } : {}),
-          extraCodebuffMetadata:
-            IS_FREEBUFF && !byok && freebuffInstanceId
-              ? {
-                  freebuff_instance_id: freebuffInstanceId,
-                  ...(freebuffReasoningEffort
-                    ? { freebuff_reasoning_effort: freebuffReasoningEffort }
-                    : {}),
-                }
-              : undefined,
-          onStateSnapshot: (snapshot) => {
-            const pinnedSnapshot = pinByokConnection(snapshot, selectedByok)
-            latestRunStateSnapshot = pinnedSnapshot
-            // Don't persist once the run is aborted or the user has switched
-            // chats: the store's messages then belong to a different
-            // conversation, and checkpointing them into this run's directory
-            // would overwrite that chat's transcript with foreign (possibly
-            // empty) state — the chat would then be hidden from /history.
-            if (abortController.signal.aborted || !runChatIsCurrent()) {
-              return
-            }
-            previousRunStateRef.current = pinnedSnapshot
-            // Persist asynchronously and coalescing: the periodic snapshot
-            // fires ~every 5s at step boundaries, and a synchronous save of the
-            // (growing) transcript on the render/input thread is what stalls
-            // long sessions. The authoritative synchronous saves below still
-            // capture the final state.
-            scheduleCheckpointSave(
-              pinnedSnapshot,
-              useChatStore.getState().messages,
-              runChatDir,
-            )
-          },
-          // Mid-turn steering: the agent loop calls this at each step
-          // boundary; texts pushed by the router since the last boundary are
-          // injected into the running turn as user prompts. The transcript
-          // bubble was already echoed at push time (router), so this only
-          // hands over the texts. Returning [] on abort leaves the entries
-          // in the buffer for the leftover handling below.
-          drainSteeringMessages: () => {
-            if (abortController.signal.aborted) return []
-            return drainSteeringBuffer(runOwnerId).map((entry) => entry.text)
-          },
+        // Read once: a stale-handle retry below must resume from the same
+        // state as the refused attempt, whose own snapshots may have landed
+        // in the ref by then.
+        const previousRunStateForTurn = canResumePreviousRun
+          ? previousRunStateRef.current
+          : null
+        // A sponsored segment: the first one (`previous` null), or a step
+        // driver fix of the SAME run, resumed from its own last state.
+        const sponsoredRunConfig = (
+          plan: SponsoredSend['plan'],
+          prompt: string,
+          previous: RunState | null,
+        ) => ({
+          // The turn's first model event reports `running` (COD-665 V5).
+          ...withSponsoredModelEventTap(
+            createRunConfig({
+              logger,
+              agent: resolvedAgent,
+              prompt,
+              content: undefined,
+              // FRESH MEMORY. The sponsored run never sees the user's
+              // conversation beyond the task context in its prompt, and its
+              // own history is never written back (see below). A fix
+              // segment resumes the sponsored run's own state, never the
+              // conversation's.
+              previousRunState: previous,
+              agentDefinitions,
+              eventHandlerState,
+              signal: abortController.signal,
+              extraCodebuffMetadata: plan.extraCodebuffMetadata,
+            }),
+            plan.onModelEvent,
+          ),
+          cwd: plan.cwd,
+          // ONLY the run's own `report_friction`, never the user's
+          // custom tools: stripping a custom tool from `toolNames` only
+          // stops it being OFFERED -- the SDK dispatches a registered
+          // custom tool by name ahead of every builtin branch.
+          customToolDefinitions: plan.customToolDefinitions,
+          overrideTools: plan.overrideTools,
         })
+        const buildRunConfig = () => sponsored
+          ? sponsoredRunConfig(sponsored.plan, effectivePrompt, null)
+          : createRunConfig({
+              logger,
+              agent: resolvedAgent,
+              prompt: effectivePrompt,
+              content: messageContent,
+              // A persisted run has a non-secret source pin. Never resume its
+              // transcript after switching to Freebuff or another BYOK revision.
+              previousRunState: previousRunStateForTurn,
+              agentDefinitions,
+              eventHandlerState,
+              observeEvent: (event) => runFunnel.event(event),
+              observeChunk: (chunk) => runFunnel.chunk(chunk),
+              signal: abortController.signal,
+              // BYOK never enters the Freebuff free-mode admission or budget path.
+              costMode: byok ? 'normal' : AGENT_MODE_TO_COST_MODE[agentMode],
+              ...(byok ? { byok } : {}),
+              extraCodebuffMetadata:
+                IS_FREEBUFF && !byok && freebuffInstanceId
+                  ? {
+                      ...freebuffSessionMetadata(freebuffInstanceId),
+                      ...(freebuffReasoningEffort
+                        ? { freebuff_reasoning_effort: freebuffReasoningEffort }
+                        : {}),
+                      ...clientDescriptorMetadata(content),
+                    }
+                  : undefined,
+              onStateSnapshot: (snapshot) => {
+                const pinnedSnapshot = pinByokConnection(snapshot, selectedByok)
+                latestRunStateSnapshot = pinnedSnapshot
+                // Don't persist once the run is aborted or the user has switched
+                // chats: the store's messages then belong to a different
+                // conversation, and checkpointing them into this run's directory
+                // would overwrite that chat's transcript with foreign (possibly
+                // empty) state — the chat would then be hidden from /history.
+                if (abortController.signal.aborted || !runChatIsCurrent()) {
+                  return
+                }
+                previousRunStateRef.current = pinnedSnapshot
+                // Persist asynchronously and coalescing: the periodic snapshot
+                // fires ~every 5s at step boundaries, and a synchronous save of the
+                // (growing) transcript on the render/input thread is what stalls
+                // long sessions. The authoritative synchronous saves below still
+                // capture the final state.
+                scheduleCheckpointSave(
+                  pinnedSnapshot,
+                  useChatStore.getState().messages,
+                  runChatDir,
+                )
+              },
+              // Mid-turn steering: the agent loop calls this at each step
+              // boundary; texts pushed by the router since the last boundary are
+              // injected into the running turn as user prompts. The transcript
+              // bubble was already echoed at push time (router), so this only
+              // hands over the texts. Returning [] on abort leaves the entries
+              // in the buffer for the leftover handling below.
+              drainSteeringMessages: () => {
+                if (abortController.signal.aborted) return []
+                return drainSteeringBuffer(runOwnerId).map(
+                  (entry) => entry.text,
+                )
+              },
+            })
+
+        funnelDetails.model = shouldUseByok
+          ? 'byok'
+          : getSelectedFreebuffModel()
+        let runConfig = buildRunConfig()
 
         // Log a summary only: the full run config contains the entire
         // conversation history and attachments, which bloats log.jsonl.
@@ -737,11 +891,86 @@ export const useSendMessage = ({
         )
         // Open the steering mailbox for this run only once we're committed to
         // calling run(); the router falls back to the queue before this point.
-        activateSteering(runOwnerId)
-        const runState = pinByokConnection(
-          await client.run(runConfig),
+        // NEVER for a sponsored turn: nothing the user types may steer the
+        // sponsor's run, so with no mailbox open it waits in the queue.
+        if (!sponsored) activateSteering(runOwnerId)
+        let runState = pinByokConnection(
+          await runWithFreebuffCatalogStaleRetry({
+            run: (attempt) => {
+              if (attempt > 0) {
+                // The catalog was refetched: rebuild the root so the same
+                // row goes out under its new handle.
+                agentDefinitions = loadAgentDefinitions()
+                resolvedAgent = resolveAgent(
+                  agentMode,
+                  agentId,
+                  agentDefinitions,
+                )
+                funnelDetails.model = shouldUseByok
+                  ? 'byok'
+                  : getSelectedFreebuffModel()
+                runConfig = buildRunConfig()
+              }
+              runFunnel.accept()
+              return client.run(runConfig as Parameters<typeof client.run>[0])
+            },
+            canRetry: () =>
+              IS_FREEBUFF &&
+              !sponsored &&
+              !byok &&
+              !abortController.signal.aborted &&
+              !hasReceivedContentRef.current &&
+              runChatIsCurrent(),
+          }),
           selectedByok,
         )
+        runFunnel.finish(
+          Boolean(runState.output && runState.output.type !== 'error'),
+        )
+        // THE CHECKS DECIDE WHEN A SPONSORED SKILL IS DONE (Desktop parity,
+        // `docs/ads/agentic/step-checks.md`): a driven run's steps are
+        // checked here, still inside this turn, and a failing step goes back
+        // to the agent as another segment of the same run. A fix that fails
+        // ends the walk on the last completed state; it never fails the turn.
+        const driveSteps = sponsored?.plan.driveSteps
+        if (
+          sponsored &&
+          driveSteps &&
+          runState.output?.type !== 'error' &&
+          !abortController.signal.aborted
+        ) {
+          runState = await driveSteps<RunState>(
+            runState,
+            async (prompt, previous) => {
+              if (abortController.signal.aborted) return null
+              try {
+                const next = await client.run(
+                  sponsoredRunConfig(
+                    sponsored.plan,
+                    prompt,
+                    previous,
+                  ) as Parameters<typeof client.run>[0],
+                )
+                return next.output?.type === 'error' ? null : next
+              } catch (error) {
+                logger.info(
+                  {
+                    error:
+                      error instanceof Error ? error.message : String(error),
+                  },
+                  '[send-message] sponsored step fix did not complete',
+                )
+                return null
+              }
+            },
+            abortController.signal,
+          )
+        }
+        if (sponsored && runState.output?.type === 'error') {
+          sponsoredErrorText =
+            runState.output.message ??
+            'The sponsored task stopped with an error.'
+        }
 
         // Only adopt and persist the result while this run's chat is still
         // the active one. After a mid-run chat switch (/new, resuming from
@@ -751,14 +980,24 @@ export const useSendMessage = ({
         // agent state into the other chat. (A plain Esc interrupt keeps the
         // same chat, so the interrupted turn is still saved as before.)
         if (!abortController.signal.aborted && runChatIsCurrent()) {
-          // Finalize: persist state and mark complete
-          previousRunStateRef.current = runState
-          setRunState(runState)
+          // Finalize: persist state and mark complete. A sponsored turn's run
+          // state is NEVER adopted: the conversation's agent keeps its own
+          // memory, and the sponsored run's history must not become part of it.
+          if (!sponsored) {
+            previousRunStateRef.current = runState
+            setRunState(runState)
+          }
           setIsRetrying(false)
 
           // Drop any queued/in-flight async checkpoint first so a stale write
           // can't land after this authoritative final save.
           await settleCheckpointSave()
+        } else if (!sponsored && runChatIsCurrent()) {
+          // An interrupted run is not adopted, but the server already created
+          // its root run: move the ad trace pointer past it, or the next
+          // prompt's offer and display requests would name it as the run
+          // carrying that prompt.
+          useChatStore.getState().noteFinishedRunForAdTrace(runState)
         }
         handleRunCompletion({
           runState,
@@ -768,7 +1007,10 @@ export const useSendMessage = ({
           updater,
           aiMessageId,
           wasAbortedByUser: abortController.signal.aborted,
-          isByokRun: shouldUseByok,
+          // A sponsored turn is not billed to the user's Freebuff session, so
+          // none of the session-gate errors that assume it was apply; they are
+          // read exactly as a BYOK turn's are.
+          isByokRun: shouldUseByok || Boolean(sponsored),
           hasReceivedContent: hasReceivedContentRef.current,
           setStreamStatus,
           setCanProcessQueue,
@@ -780,10 +1022,21 @@ export const useSendMessage = ({
         })
         if (!abortController.signal.aborted && runChatIsCurrent()) {
           // Completion flushes the last batched text and marks the message
-          // finished. Persist that committed state, not the preceding frame.
-          saveChatState(runState, useChatStore.getState().messages, runChatDir)
+          // finished. Persist that committed state, not the preceding frame --
+          // and for a sponsored turn, the transcript with the CONVERSATION's
+          // run state, which it never touched.
+          saveChatState(
+            sponsored ? latestRunStateSnapshot : runState,
+            useChatStore.getState().messages,
+            runChatDir,
+          )
         }
       } catch (error) {
+        runFunnel.finish(false)
+        if (sponsored) {
+          sponsoredErrorText =
+            error instanceof Error ? error.message : String(error)
+        }
         // If this run was aborted, the abort handler already handled cleanup.
         // Don't run error handling to avoid interfering with any new run that
         // may have started. Uses per-run abortController.signal (not shared
@@ -800,7 +1053,7 @@ export const useSendMessage = ({
             isProcessingQueueRef,
             isQueuePausedRef,
             hasReceivedContent: hasReceivedContentRef.current,
-            isByokRun: shouldUseByok,
+            isByokRun: shouldUseByok || Boolean(sponsored),
           })
           // Persist the last checkpoint plus the error banner so a restart
           // after a failed run still shows this turn. Settle async checkpoints
@@ -815,6 +1068,14 @@ export const useSendMessage = ({
             )
           }
         } else {
+          // Same as an interrupted run that returned: point past it, using
+          // the last snapshot it reached (which carries its run id once the
+          // runtime had started it).
+          if (!sponsored && runChatIsCurrent()) {
+            useChatStore
+              .getState()
+              .noteFinishedRunForAdTrace(latestRunStateSnapshot)
+          }
           logger.debug({ error }, '[send-message] Ignoring error after abort')
         }
       } finally {
@@ -876,6 +1137,9 @@ export const useSendMessage = ({
           }
         }
         updater.dispose()
+        // The verdict is the run service's, read off its own receipts; this
+        // only says how the turn ended.
+        settleSponsored(abortController.signal.aborted)
       }
     },
     [

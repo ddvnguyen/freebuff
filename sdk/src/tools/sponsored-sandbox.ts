@@ -25,13 +25,11 @@
  * anywhere but the worktree and the run's private runtime directory, including
  * through a symlink; git finding an ambient credential or prompting for one.
  *
- * Also stops: reaching the machine the run is on. Both profiles deny loopback,
- * because the orchestrator's own API listens there.
+ * macOS denies host loopback. Linux shares the host network, including
+ * loopback, so commands can use the host's DNS, downloads and service APIs.
  *
- * What it does NOT stop is written down in
- * `docs/freebuff-sponsored-local-execution.md` §9, which is private. This file
- * ships to the public repository, and an inventory of a boundary's gaps is
- * worth more to somebody probing it than to anybody maintaining it.
+ * Known limits are tracked privately
+ * (`docs/freebuff-sponsored-local-execution.md` §9).
  *
  * ## Refuse, never downgrade
  *
@@ -65,10 +63,24 @@ import {
   type SponsoredLocalContainment,
   type SponsoredWindowsRunPaths,
 } from '@codebuff/common/ads/sponsored-local-execution'
+import {
+  CREDENTIAL_BASENAMES,
+  CREDENTIAL_SUFFIXES,
+  evaluateSponsoredReadPath,
+} from '@codebuff/common/ads/sponsored-capabilities'
+import { withSponsoredRunCredentialEnv } from '@codebuff/common/ads/sponsored-run-credentials'
+import { parseCodeSearchFlags } from '@codebuff/common/util/code-search-flags'
+import { ENV_TEMPLATE_FILE_PATTERNS } from '@codebuff/common/util/env-file-path'
 
 import { getSystemProcessEnv } from '../env'
 import { getBundledRgPath } from '../native/ripgrep'
-import { INCLUDED_HIDDEN_DIRS, parseCodeSearchFlags } from './code-search'
+import {
+  findBubblewrap,
+  SPONSORED_LINUX_RUNTIME_ROOTS,
+  sponsoredLinuxRuntimePath,
+  sponsoredLinuxSearchPath,
+} from './sponsored-linux-runtime'
+import { INCLUDED_HIDDEN_DIRS } from './code-search'
 import {
   sameWindowsPath,
   windowsNativePath,
@@ -81,12 +93,15 @@ import type {
   TerminalCommandSpawnRequest,
 } from './run-terminal-command'
 
-/** Where `bwrap` is on the distributions we have seen it on. */
-const BWRAP_PATHS = ['/usr/bin/bwrap', '/bin/bwrap', '/usr/local/bin/bwrap']
+export { findBubblewrap } from './sponsored-linux-runtime'
 
-export function findBubblewrap(): string | null {
-  return BWRAP_PATHS.find((candidate) => fs.existsSync(candidate)) ?? null
-}
+// Keep the capability probe and real commands on the same namespace policy.
+const LINUX_NAMESPACE_ARGS = [
+  '--die-with-parent',
+  '--unshare-all',
+  '--share-net',
+  '--new-session',
+]
 
 /**
  * Whether this machine can contain a sponsored run, and with what.
@@ -99,10 +114,11 @@ export function probeSponsoredContainment(
   dependencies: {
     exists: (pathname: string) => boolean
     execute: (command: string, args: string[]) => boolean
+    realpath?: (pathname: string) => string
+    searchPath?: string
   },
 ): SponsoredLocalContainment {
-  const bwrap =
-    platform === 'linux' ? BWRAP_PATHS.find(dependencies.exists) : undefined
+  const bwrap = platform === 'linux' ? findBubblewrap(dependencies) : undefined
   const containment = sponsoredLocalContainment(platform, {
     bwrapAvailable: Boolean(bwrap),
   })
@@ -128,8 +144,8 @@ export function probeSponsoredContainment(
     ]
   } else {
     command = bwrap!
-    args = ['--die-with-parent', '--unshare-all', '--new-session']
-    for (const directory of ['/usr', '/bin', '/lib', '/lib64']) {
+    args = [...LINUX_NAMESPACE_ARGS]
+    for (const directory of SPONSORED_LINUX_RUNTIME_ROOTS) {
       if (dependencies.exists(directory))
         args.push('--ro-bind', directory, directory)
     }
@@ -140,7 +156,11 @@ export function probeSponsoredContainment(
       '/dev',
       '--clearenv',
       '--',
-      '/bin/true',
+      // NixOS provides /bin/sh, but not /bin/true. Use a shell builtin so
+      // the probe needs no extra coreutils path or writable profile mount.
+      '/bin/sh',
+      '-c',
+      'exit 0',
     )
   }
   if (!dependencies.exists(command) || !dependencies.execute(command, args)) {
@@ -173,7 +193,8 @@ export function sponsoredContainment(
  * Where a LINKED worktree keeps the repository it belongs to.
  *
  * Desktop runs a sponsored turn in a linked worktree at
- * `<project>/.freebuff/worktrees/<threadId>`, whose `.git` is a gitfile
+ * `~/.freebuff/worktrees/<short-id>/<repo-name>` (older releases:
+ * `<project>/.freebuff/worktrees/<threadId>`), whose `.git` is a gitfile
  * pointing at `<project>/.git/worktrees/<threadId>` — OUTSIDE the workspace.
  * With the write roots at `[workspaceRoot, runtimeDir]` and nothing granting
  * the common dir, every git command died at repository discovery:
@@ -222,6 +243,8 @@ export interface SponsoredLinkedWorktree {
 }
 
 export interface SponsoredSandboxOptions {
+  /** Trusted host PTY transport. Receives the already-contained argv and scrubbed environment. */
+  spawnProcess?: (launch: TerminalCommandSpawnRequest) => TerminalCommandProcess
   /** The worktree. The only tracked tree this run may write. */
   workspaceRoot: string
   /**
@@ -238,6 +261,13 @@ export interface SponsoredSandboxOptions {
   /** Extra trees the run may READ (a toolchain, a shared cache). Never write. */
   additionalReadRoots?: string[]
   /**
+   * Toolchains Freebuff installed for runs (`sponsored-managed-node.ts`):
+   * each `root` is granted READ-ONLY like `additionalReadRoots`, and each
+   * `binDir` goes at the END of the run's `PATH`, so the user's own install
+   * of the same tool is always found first.
+   */
+  managedToolchains?: readonly { root: string; binDir: string }[]
+  /**
    * Set when `workspaceRoot` is a LINKED worktree, so git can reach its
    * repository. See {@link SponsoredLinkedWorktree}.
    *
@@ -249,6 +279,30 @@ export interface SponsoredSandboxOptions {
    * the reasoning and the test.
    */
   linkedWorktree?: SponsoredLinkedWorktree
+  /**
+   * The run edits the user's working copy IN PLACE and delivers no commit
+   * (`docs/freebuff-sponsored-local-execution.md`, 2026-09-24), so
+   * `<workspaceRoot>/.git` is carved out of the write root and left readable.
+   *
+   * The INVERSE of `linkedWorktree`: that one exists so a sandboxed run CAN
+   * commit into the user's repository, this one so it cannot touch history at
+   * all. They are never both set. Like that one, it is a FACT rather than a
+   * path list, for the same reason -- a caller that could name the paths
+   * could name the wrong ones.
+   */
+  readOnlyGitDir?: boolean
+  /**
+   * The credentials the user connected for THIS run (COD-665), keyed by the
+   * variable the reviewed procedure declared (`requires-credential:`).
+   *
+   * Added AFTER the scrub, on both arms, by `withSponsoredRunCredentialEnv`:
+   * the scrub and its credential-shape assertion run exactly as before, and
+   * the one exception to that assertion is exactly these names. Never read
+   * from the host environment -- a user's own `SIEVE_API_KEY` in their shell
+   * is still scrubbed. Absent or empty, the environment is byte-identical to
+   * what it was before this option existed.
+   */
+  credentialEnv?: Readonly<Record<string, string>>
   /** Injected by the eval, which keeps its own (wider) allowlist. */
   scrubEnv?: (
     source: Record<string, string | undefined>,
@@ -382,7 +436,7 @@ function realpathForContainment(
   verb: 'read files' | 'write' | 'run commands',
 ): string {
   try {
-    return fs.realpathSync(target)
+    return physicalPath(target)
   } catch {
     // A dangling link and an unreadable/resolution-loop path are both an
     // unknown physical destination. Unknown is a refusal at this boundary.
@@ -392,17 +446,36 @@ function realpathForContainment(
   }
 }
 
+/**
+ * `fs.realpathSync`, except that it never asks the kernel to NAME a file.
+ *
+ * Under Bun on macOS, realpath is `F_GETPATH` on an open descriptor, and a
+ * file with several hard links has no single name: the kernel answers with
+ * whichever link it last looked up. A worktree file that is also linked from
+ * outside therefore realpathed outside now and then (10 in 3,000 calls on a
+ * Mac), and a write the rooted layer handles safely was refused as a symlink
+ * escape. Directories cannot be hard linked, so the parent is realpathed and
+ * the leaf keeps its own name; a symlinked leaf is followed by hand so its
+ * target gets the same treatment. Windows' final path names the link the
+ * handle was opened by, so it keeps the native answer.
+ */
+function physicalPath(target: string, hops = 0): string {
+  if (process.platform === 'win32') return fs.realpathSync(target)
+  const stat = fs.lstatSync(target)
+  if (stat.isDirectory()) return fs.realpathSync(target)
+  const parent = fs.realpathSync(path.dirname(target))
+  if (!stat.isSymbolicLink()) return path.join(parent, path.basename(target))
+  // the kernel's own limit (MAXSYMLINKS on macOS and Linux)
+  if (hops >= 32) throw new Error('too many levels of symbolic links')
+  return physicalPath(
+    path.resolve(parent, fs.readlinkSync(target)),
+    hops + 1,
+  )
+}
+
 function escapesRoot(root: string, target: string): boolean {
   const relative = path.relative(root, target)
   return relative.startsWith('..') || path.isAbsolute(relative)
-}
-
-function realpathOrSelf(target: string): string {
-  try {
-    return fs.realpathSync(target)
-  } catch {
-    return target
-  }
 }
 
 /**
@@ -442,13 +515,10 @@ export function assertSponsoredWritePath(
 /**
  * Refuse a READ outside the worktree, by the same rule as a write.
  *
- * Why this exists at all is the whole of finding F1: the broker below covers
- * exactly ONE tool. `read_files`, `code_search` and `list_directory` execute
- * in the orchestrator's own process, as the user, and each resolves an
- * absolute path deliberately — so a procedure containing no shell command at
- * all could read the user's private keys and hand them to the granted
- * `read_url`. The clamp is applied by the surface, per tool, before the tool
- * runs; this is the shared rule it applies.
+ * The broker below covers only the terminal tool. `read_files`, `code_search`
+ * and `list_directory` execute in the orchestrator's own process, so the
+ * surface applies this clamp per tool, before the tool runs; this is the
+ * shared rule it applies.
  */
 export function assertSponsoredReadPath(
   workspaceRoot: string,
@@ -959,12 +1029,8 @@ function traversableAncestors(targets: string[]): string[] {
  *    /dev/stderr` are ordinary shell-script spellings; a build that uses one
  *    should not die inside a sponsored run.
  *
- *    It does not widen the boundary. `/dev/fd/N` names the process's OWN
- *    descriptors, and re-opening one is evaluated by seatbelt against the
- *    UNDERLYING file — measured: with this grant in place, `exec 3<
- *    outside.txt; echo PWNED > /dev/fd/3` is refused with the error naming
- *    `outside.txt` rather than `/dev/fd/3`, and the file is unchanged. Same
- *    for `/etc/hosts`, which answers `Permission denied`.
+ *    `/dev/fd/N` names the process's OWN descriptors, and seatbelt evaluates
+ *    a re-open against the underlying file, so the grant adds no file access.
  *  - `/dev/tty` — NOT granted. The broker spawns `detached` with pipes for
  *    stdio, so the run has no controlling terminal: measured, reading
  *    `/dev/tty` answers "Device not configured" whether or not the write is
@@ -978,13 +1044,8 @@ function traversableAncestors(targets: string[]): string[] {
  *    ablation needed them, and `/dev/stdin` is a `/dev/fd/0` symlink already
  *    covered above.
  *
- * KNOWN, AND NOT A DEVICE PROBLEM: BSD `diff <(…)` still fails with
- * `/dev/fd/63: Operation not permitted`. Measured, that is fixed by neither
- * `(subpath "/dev")`, nor `file-ioctl`, nor granting the confstr temp
- * directory — only a blanket `(allow file*)` clears it — so it is a file
- * operation on the anonymous pipe with no path to name. `cat`, `grep`,
- * `source` and bash's `<<<` all work with process substitution. Left alone
- * rather than bought with a blanket grant.
+ * BSD `diff <(…)` does not work inside the run; supporting it would need a
+ * blanket file grant, so it is left alone.
  */
 const SPONSORED_DEVICE_WRITE_LITERALS: readonly string[] = ['/dev/null']
 const SPONSORED_DEVICE_WRITE_SUBPATHS: readonly string[] = ['/dev/fd']
@@ -993,14 +1054,8 @@ const SPONSORED_DEVICE_WRITE_SUBPATHS: readonly string[] = ['/dev/fd']
  * `readlink("/var")`, which is the whole of what the system resolver needs.
  *
  * Without it `getaddrinfo` answers `ENOTFOUND` for every name, so `curl
- * https://example.com` and `git ls-remote https://…` fail. Egress is accepted
- * by COD-336 decision item 8, and this made the granted capability work only
- * for a caller who already knew an address — a silent failure for an honest
- * procedure, and no boundary at all. It closes a hole in the STATED
- * capability rather than in the containment; the measurements behind that
- * claim are in `docs/freebuff-sponsored-local-execution.md` §9, which is
- * private, because an account of what a boundary does not stop is worth more
- * to somebody probing it than to anybody maintaining it.
+ * https://example.com` and `git ls-remote https://…` fail. See
+ * `docs/freebuff-sponsored-local-execution.md` §9.
  *
  * Bisected to this one literal on macOS 26.5: the resolver reads the `/var`
  * SYMLINK, and the profile's ancestor grants only ever cover `/private/var`
@@ -1156,9 +1211,8 @@ function underSystemReadRoot(target: string): boolean {
  *     neither the shim nor an unreadable entry can win inside the run.
  *
  * The profile is unchanged by this: no read grant, no write grant, no new
- * environment variable. PATH is not a boundary — the run can already exec
- * any binary the profile reads — so choosing which one `git` names moves
- * nothing the sandbox decides. A grant on the data link was measured and
+ * environment variable, so choosing which binary `git` names changes nothing
+ * the sandbox decides. A grant on the data link was measured and
  * rejected; `docs/freebuff-sponsored-local-execution.md` §9 has why.
  *
  * What else moves, measured on the Command Line Tools: the stand-ins re-resolve
@@ -1354,8 +1408,7 @@ const SPONSORED_MAC_GIT_HOST: SponsoredMacGitDependencies = {
  *    `index.lock`, `COMMIT_EDITMSG`, `logs/HEAD`. REQUIRED; it is where the
  *    commit is actually assembled. Scoped to THIS worktree's directory, not to
  *    `worktrees/`, so one sponsored run cannot reach another's index.
- *  - `objects` — the new commit, tree and blob objects. REQUIRED, and the one
- *    grant here that is genuinely wide; see the honest limit below.
+ *  - `objects` — the new commit, tree and blob objects. REQUIRED.
  *  - `refs/heads/<branchNamespace>` — the branch tip. Scoped to the app's own
  *    namespace, so `refs/heads/main` is NOT writable: measured, `echo x >
  *    .git/refs/heads/main` is `Operation not permitted` with this grant in
@@ -1384,25 +1437,8 @@ const SPONSORED_MAC_GIT_HOST: SponsoredMacGitDependencies = {
  * the point: the branch has to land in the user's own repository for the pull
  * request to be openable from it.
  *
- * ## The honest limits
- *
- * **`objects` is a real write grant on the user's repository.** A run can
- * create objects freely (that is what committing is) and can also overwrite an
- * existing loose object, which corrupts the repository. It cannot be narrowed
- * — the commit has to land where the user's git will find it, and seatbelt
- * cannot express "create but do not overwrite". It is vandalism rather than
- * privilege escalation, `git fsck` names it, and nothing about it executes
- * code; that is the whole of why it is accepted.
- *
- * **READ of `<project>/.git/config` cannot be avoided.** git opens it on every
- * command, so a repository whose remote URL carries an embedded token exposes
- * that token to the run. Measured: denying read of it makes git fail outright
- * (`fatal: unable to access '.git/config'`) on `status`, `add` and `commit`
- * alike, so there is no version of this where git works and that file is
- * unreadable. Written down rather than left to be discovered; the alternative
- * designs that avoid it are recorded in
- * `docs/freebuff-sponsored-local-execution.md` §9 along with why they cost
- * more than they save.
+ * Known limits are tracked privately
+ * (`docs/freebuff-sponsored-local-execution.md` §9).
  */
 export function sponsoredLinkedWorktreeGrants(
   linked: SponsoredLinkedWorktree,
@@ -1440,10 +1476,162 @@ export const SPONSORED_GIT_FORBIDDEN_WRITES: readonly string[] = [
   'packed-refs',
 ]
 
+// --------------------------------------------- secrets inside the workspace
+
+/**
+ * THE SHELL REFUSES WHAT THE FILE TOOLS REFUSE. An in-place run's workspace is
+ * the user's real folder, so it holds real secrets -- `.env.local`, a key, an
+ * `.npmrc` -- which `evaluateSponsoredReadPath` keeps from `read_files`. A
+ * sandbox that grants the whole workspace readable hands the same files to
+ * `cat` in one command, so both arms take them back here, from the same
+ * lists: the `.env` family except the exact template names, the credential
+ * basenames and the credential suffixes.
+ */
+const ENV_TEMPLATE_BASENAMES = ENV_TEMPLATE_FILE_PATTERNS.filter(
+  (pattern) => !pattern.includes('*'),
+)
+
+/**
+ * A seatbelt regex fragment matching `text` literally: every metacharacter
+ * escaped, and, when `foldCase`, every letter as a two-case class. File NAMES
+ * are folded because the default macOS volume is case-insensitive, so
+ * `.ENV.LOCAL` opens `.env.local`; the root is canonical and kept exact.
+ */
+function sbplLiteral(text: string, foldCase: boolean): string {
+  let out = ''
+  for (const ch of text) {
+    if (foldCase && /[a-z]/i.test(ch)) {
+      out += `[${ch.toLowerCase()}${ch.toUpperCase()}]`
+    } else if (/[.*+?^${}()|[\]\\]/.test(ch)) {
+      out += `\\${ch}`
+    } else {
+      out += ch
+    }
+  }
+  return out
+}
+
+/**
+ * The macOS half: a deny on the secret classes under the workspace, emitted
+ * AFTER every allow (seatbelt takes the last match), then the templates
+ * granted back. Patterns rather than a list of files, so a secret created
+ * after the run starts is refused too.
+ */
+export function sponsoredMacSecretReadRules(workspaceRoot: string): string[] {
+  const root = canonicalRoot(workspaceRoot)
+  if (/["\r\n]/.test(root)) {
+    throw new Error(
+      'A sponsored workspace path may not contain a quote or a line break.',
+    )
+  }
+  const under = `^${sbplLiteral(root, false)}/(.*/)?`
+  const fold = (text: string) => sbplLiteral(text, true)
+  const credentialNames = [...CREDENTIAL_BASENAMES].map(fold).join('|')
+  const credentialSuffixes = CREDENTIAL_SUFFIXES.map(fold).join('|')
+  // WRITES TOO, not only reads: a rename is a write on the source path, and
+  // `mv .env.local x && cat x` read the secret -- and took the user's file
+  // away -- while only reads were denied (measured). The file tools refuse to
+  // write these as well, so nothing legitimate is lost.
+  return [
+    `(deny file-read* file-write* ${[
+      `(regex #"${under}${fold('.env')}(\\.[^/]*)?$")`,
+      `(regex #"${under}(${credentialNames})$")`,
+      `(regex #"${under}[^/]*(${credentialSuffixes})$")`,
+    ].join(' ')})`,
+    `(allow file-read* file-write* ${ENV_TEMPLATE_BASENAMES.map(
+      (name) => `(regex #"${under}${fold(name)}$")`,
+    ).join(' ')})`,
+  ]
+}
+
+/**
+ * Directories the Linux scan does not walk, and why each is safe to leave:
+ *
+ *  - `node_modules`: third-party PACKAGE content, public on the registry, not
+ *    the user's secrets -- a certificate there is a test fixture. Walking it
+ *    would cost every command a scan of often hundreds of thousands of
+ *    entries, and trip the bound in most JavaScript repositories. The file
+ *    tools still refuse those names; macOS's pattern covers them too. This
+ *    is the one place the Linux arm is knowingly narrower.
+ *  - `.git/objects`: compressed history, never a secret by NAME. What was
+ *    committed is readable through `git show` on every arm alike; that is the
+ *    repository's content, not a file this rule could mask.
+ *
+ * The rest of `.git` IS walked: a key dropped there is the user's own.
+ */
+function secretScanSkips(parent: string, name: string): boolean {
+  return (
+    name === 'node_modules' ||
+    (name === 'objects' && path.basename(parent) === '.git')
+  )
+}
+
+/**
+ * How many directory entries the Linux scan will visit before refusing. A
+ * bound, not a sample: a scan that stopped early would leave the rest of the
+ * workspace's secrets readable, so past it the run is refused outright --
+ * the same "refuse, never downgrade" as a missing `bwrap`.
+ */
+export const SPONSORED_SECRET_SCAN_LIMIT = 200_000
+
+/**
+ * The Linux half: every file under the workspace the read policy refuses, so
+ * `spawnLinux` can mask each with `/dev/null`. bubblewrap has no pattern rule,
+ * so these are the files that exist at spawn; one the run writes itself is
+ * its own content, not the user's.
+ */
+export function sponsoredSecretFiles(
+  workspaceRoot: string,
+  limit: number = SPONSORED_SECRET_SCAN_LIMIT,
+): string[] {
+  const root = path.resolve(workspaceRoot)
+  const found: string[] = []
+  const pending = [root]
+  let visited = 0
+  while (pending.length > 0) {
+    const dir = pending.pop()!
+    let entries: fs.Dirent[]
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      visited += 1
+      if (visited > limit) {
+        throw new Error(
+          'This workspace is too large to scan for secret files, so a sponsored run will not be started in it.',
+        )
+      }
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) {
+        if (!secretScanSkips(dir, entry.name)) pending.push(full)
+        continue
+      }
+      // Files AND symlinks: a bind over a link masks what it points at.
+      const decision = evaluateSponsoredReadPath(full, { workspaceRoot: root })
+      if (!decision.allowed && decision.code === 'credential_file') {
+        found.push(full)
+      }
+    }
+  }
+  return found.sort()
+}
+
 export function sponsoredMacProfile(
   writeRoots: string[],
   additionalReadRoots: string[],
   writeLiterals: string[] = [],
+  /**
+   * Carved OUT of the write roots above, for an in-place run
+   * (`docs/freebuff-sponsored-local-execution.md`, 2026-09-24): the
+   * workspace's own `.git`, which such a run may read and must not write.
+   * Seatbelt takes the LAST matching rule, so these denies are emitted after
+   * the `file-write*` allow that covers the workspace.
+   */
+  denyWriteSubpaths: string[] = [],
+  /** Workspaces whose secret files are unreadable; see `sponsoredMacSecretReadRules`. */
+  secretReadRoots: string[] = [],
 ): string {
   const q = JSON.stringify
   const writable = writeRoots.map(canonicalRoot)
@@ -1494,13 +1682,10 @@ export function sponsoredMacProfile(
     // `node` and `/bin/date` working.
     '(allow sysctl-read)',
     '(allow mach-lookup)',
-    // EGRESS IS ALLOWED, LOOPBACK IS NOT, and the second half is not a detail.
-    // Egress off the machine is accepted by decision (COD-336 item 8) and was
-    // never bounded on Cloud either. Egress to THIS machine is a different
-    // thing entirely: the Desktop orchestrator listens on 127.0.0.1:8787 and
-    // its API can push a branch, open a pull request with the user's own
-    // credentials, and drive the user's own unsandboxed agent. A sandbox that
-    // reaches its own supervisor over loopback contains nothing.
+    // LOOPBACK IS DENIED. The Desktop orchestrator listens on loopback and its
+    // API acts with the user's own credentials, so the run must not reach it.
+    // Network policy beyond that: `docs/freebuff-sponsored-local-execution.md`
+    // §9.
     //
     // The `deny` has to come AFTER the `allow`: seatbelt takes the LAST
     // matching rule, so the order here is the rule.
@@ -1533,6 +1718,19 @@ export function sponsoredMacProfile(
       ...SPONSORED_DEVICE_WRITE_LITERALS.map((item) => `(literal ${q(item)})`),
       ...SPONSORED_DEVICE_WRITE_SUBPATHS.map((item) => `(subpath ${q(item)})`),
     ].join(' ')})`,
+    // AFTER the allow, and that order IS the rule: seatbelt takes the last
+    // match. An in-place run's `.git` lives inside the write root it must
+    // otherwise be able to edit, so the only way to hold the line is to grant
+    // the tree and take this back.
+    ...(denyWriteSubpaths.length > 0
+      ? [
+          `(deny file-write* ${denyWriteSubpaths
+            .map((item) => `(subpath ${q(canonicalRoot(item))})`)
+            .join(' ')})`,
+        ]
+      : []),
+    // LAST, after every file-read allow above, for the same reason.
+    ...secretReadRoots.flatMap(sponsoredMacSecretReadRules),
   ].join('\n')
 }
 
@@ -1542,24 +1740,27 @@ function spawnMac(
   env: NodeJS.ProcessEnv,
   additionalReadRoots: string[],
   writeLiterals: string[],
+  /** Carved back out of the write roots; see `sponsoredMacProfile`. */
+  denyWriteSubpaths: string[] = [],
+  secretReadRoots: string[] = [],
+  spawnProcess?: SponsoredSandboxOptions['spawnProcess'],
 ): TerminalCommandProcess {
-  return processHandle(
-    spawn(
-      '/usr/bin/sandbox-exec',
-      [
+  const args = [
         '-p',
-        sponsoredMacProfile(writeRoots, additionalReadRoots, writeLiterals),
+        sponsoredMacProfile(
+          writeRoots,
+          additionalReadRoots,
+          writeLiterals,
+          denyWriteSubpaths,
+          secretReadRoots,
+        ),
         request.executable,
         ...request.args,
-      ],
-      {
-        cwd: request.cwd,
-        env,
-        detached: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      },
-    ),
-  )
+      ]
+  if (spawnProcess) return spawnProcess({ executable: '/usr/bin/sandbox-exec', args, cwd: request.cwd, env })
+  return processHandle(spawn('/usr/bin/sandbox-exec', args, {
+    cwd: request.cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
+  }))
 }
 
 /**
@@ -1670,6 +1871,13 @@ function spawnLinux(
   env: NodeJS.ProcessEnv,
   additionalReadRoots: string[],
   linkedWorktree: SponsoredLinkedWorktree | undefined,
+  /** Read-only rebinds over the write roots; see the loop at the bottom. */
+  denyWriteSubpaths: string[] = [],
+  /** Files masked with `/dev/null`; see `sponsoredSecretFiles`. */
+  secretFiles: string[] = [],
+  /** Names in `env` that are the run's connected credentials (COD-665). */
+  credentialNames: ReadonlySet<string> = new Set(),
+  spawnProcess?: SponsoredSandboxOptions['spawnProcess'],
 ): TerminalCommandProcess {
   const bwrap = findBubblewrap()
   if (!bwrap) {
@@ -1678,35 +1886,16 @@ function spawnLinux(
       'bubblewrap (bwrap) is required to contain a sponsored run on Linux.',
     )
   }
-  // NO `--share-net`. bubblewrap has no firewall — it can give the run the
-  // host's network namespace or a fresh empty one, and nothing in between —
-  // so "network minus loopback", which is what the macOS profile above
-  // expresses, is not sayable here. Faced with that, the run gets its own
-  // empty namespace:
-  //
-  //   - loopback egress is the one that MATTERS. `--share-net` puts the run
-  //     on the same 127.0.0.1 as the orchestrator, whose API pushes branches
-  //     and opens pull requests with the user's real credentials.
-  //   - nothing granted actually needs the sandbox to reach the internet.
-  //     `read_url` and `web_search` — the two tools carrying the `network`
-  //     capability — execute in the orchestrator's process, not in here, and
-  //     dependency installs are refused outright (COD-336 item 5).
-  //
-  // So this diverges from the macOS arm, which keeps external egress, and the
-  // divergence is deliberate: on Linux the choice is between blocking
-  // loopback and keeping a capability nothing uses.
-  const args = ['--die-with-parent', '--unshare-all', '--new-session']
-  for (const dir of [
-    '/usr',
-    '/bin',
-    '/sbin',
-    '/lib',
-    '/lib64',
-    '/etc',
-    '/opt',
-  ]) {
+  // Share networking so CLI downloads and remote API calls work. This also
+  // exposes host loopback; Linux no longer provides network containment.
+  // Filesystem, process and environment isolation still apply.
+  const args = [...LINUX_NAMESPACE_ARGS]
+  for (const dir of [...SPONSORED_LINUX_RUNTIME_ROOTS, '/etc', '/opt']) {
     if (fs.existsSync(dir)) args.push('--ro-bind', dir, dir)
   }
+  // /etc/resolv.conf often points into /run (systemd-resolved), which is not
+  // otherwise mounted. Sharing the network alone would still leave DNS broken.
+  args.push(...sponsoredLinuxResolverMounts())
   const commonDir = linkedWorktree
     ? path.resolve(linkedWorktree.commonDir)
     : null
@@ -1742,23 +1931,82 @@ function spawnLinux(
   for (const dir of writeRoots) {
     if (fs.existsSync(dir)) args.push('--bind', dir, dir)
   }
-  args.push('--chdir', request.cwd, '--clearenv')
-  for (const [key, value] of Object.entries(env)) {
-    if (value !== undefined) args.push('--setenv', key, value)
+  // AFTER the writable binds, and that order IS the rule: bubblewrap applies
+  // mounts in order, so a read-only bind here covers the writable one under
+  // it. An in-place run's `.git` sits inside the workspace it must otherwise
+  // be able to edit, so the tree is granted and this takes it back.
+  for (const dir of denyWriteSubpaths) {
+    if (fs.existsSync(dir)) args.push('--ro-bind', dir, dir)
   }
-  args.push(request.executable, ...request.args)
+  // LAST of the mounts, over the writable workspace: each secret file reads
+  // as empty and discards writes, which is what the file tools refuse.
+  for (const file of secretFiles) {
+    if (fs.existsSync(file)) args.push('--ro-bind', '/dev/null', file)
+  }
+  args.push('--chdir', request.cwd)
+  const envArgs = sponsoredLinuxEnvArgs(env, credentialNames)
+  args.push(...envArgs.args)
+  args.push(sponsoredLinuxRuntimePath(request.executable), ...request.args)
+  if (spawnProcess) return spawnProcess({ executable: bwrap, args, cwd: request.cwd, env: envArgs.spawnEnv as NodeJS.ProcessEnv })
   return processHandle(
     spawn(bwrap, args, {
       cwd: request.cwd,
       // `bwrap` itself only needs a PATH; `--clearenv` plus the `--setenv`
-      // pairs above are what the CHILD sees. Cast because some consumers
-      // declare a required-key ProcessEnv, and inheriting keys to satisfy a
-      // type would defeat the point of the scrub.
-      env: { PATH: env.PATH } as unknown as NodeJS.ProcessEnv,
+      // pairs above are what the CHILD sees -- and, for a run with connected
+      // credentials, those credentials, which ride bwrap's own environment
+      // rather than its argv (see `sponsoredLinuxEnvArgs`). Cast because some
+      // consumers declare a required-key ProcessEnv, and inheriting keys to
+      // satisfy a type would defeat the point of the scrub.
+      env: envArgs.spawnEnv as unknown as NodeJS.ProcessEnv,
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     }),
   )
+}
+
+/** Keep the host resolver's symlink target readable without exposing all of /run. */
+export function sponsoredLinuxResolverMounts(
+  resolverPath = '/etc/resolv.conf',
+): string[] {
+  if (!fs.existsSync(resolverPath)) return []
+  const target = fs.realpathSync(resolverPath)
+  return target === resolverPath ? [] : ['--ro-bind', target, target]
+}
+
+/**
+ * How the Linux arm hands the run its environment. PURE, so the argv can be
+ * asserted on any OS.
+ *
+ * Every variable used to go through `--clearenv` plus `--setenv KEY VALUE`,
+ * which puts each value in bwrap's ARGV -- and `/proc/<pid>/cmdline` is
+ * readable by every user on the machine. That is harmless for `PATH` and
+ * `HOME`, and it is not for a key the user just typed (COD-665). So a
+ * connected credential travels in bwrap's own process environment instead
+ * (`/proc/<pid>/environ` is readable only by its owner), which bwrap passes
+ * through to the child; everything else is still a `--setenv`, which overrides
+ * it. `--clearenv` is dropped ONLY then, because it would clear the
+ * credentials too, and it has nothing else to clear: bwrap's environment is
+ * exactly `{ PATH, ...credentials }`, set here.
+ *
+ * With no credentials the argv and spawn environment are exactly what they
+ * were before this function existed.
+ */
+export function sponsoredLinuxEnvArgs(
+  env: NodeJS.ProcessEnv | Record<string, string | undefined>,
+  credentialNames: ReadonlySet<string> = new Set(),
+): { args: string[]; spawnEnv: Record<string, string | undefined> } {
+  const args: string[] = []
+  const spawnEnv: Record<string, string | undefined> = { PATH: env.PATH }
+  const carriesCredentials = [...credentialNames].some(
+    (name) => env[name] !== undefined,
+  )
+  if (!carriesCredentials) args.push('--clearenv')
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) continue
+    if (credentialNames.has(key)) spawnEnv[key] = value
+    else args.push('--setenv', key, value)
+  }
+  return { args, spawnEnv }
 }
 
 // ------------------------------------------------------ the Windows floor
@@ -1976,6 +2224,7 @@ function windowsFloorProcessHandle(
 function createWindowsFloorBroker(
   workspaceRoot: string,
   runtimeDir: string,
+  credentialEnv?: () => Readonly<Record<string, string>> | undefined,
 ): TerminalCommandBroker {
   const paths = sponsoredWindowsRunPaths(runtimeDir)
   return {
@@ -1990,7 +2239,10 @@ function createWindowsFloorBroker(
       ]) {
         fs.mkdirSync(dir, { recursive: true })
       }
-      const env = scrubSponsoredWindowsEnv(request.env, paths)
+      const env = withSponsoredRunCredentialEnv(
+        scrubSponsoredWindowsEnv(request.env, paths),
+        credentialEnv?.(),
+      )
       const launch = sponsoredWindowsFloorLaunch(request)
       return windowsFloorProcessHandle(
         spawn(launch.file, launch.args, {
@@ -2025,8 +2277,13 @@ export function createSponsoredTerminalBroker(
 ): TerminalCommandBroker {
   const workspaceRoot = path.resolve(options.workspaceRoot)
   const runtimeDir = path.resolve(options.runtimeDir)
-  const additionalReadRoots = (options.additionalReadRoots ?? []).map((item) =>
-    path.resolve(item),
+  const managedToolchains = options.managedToolchains ?? []
+  const additionalReadRoots = [
+    ...(options.additionalReadRoots ?? []),
+    ...managedToolchains.map((toolchain) => toolchain.root),
+  ].map((item) => path.resolve(item))
+  const managedBinDirs = managedToolchains.map((toolchain) =>
+    path.resolve(toolchain.binDir),
   )
   const platform = options.platform ?? process.platform
   if (
@@ -2036,7 +2293,12 @@ export function createSponsoredTerminalBroker(
       serverGrant: options.serverGrant,
     }) === 'floor'
   ) {
-    return createWindowsFloorBroker(workspaceRoot, runtimeDir)
+    if (options.spawnProcess) throw new Error('Sponsored interactive terminals require macOS or Linux containment.')
+    return createWindowsFloorBroker(
+      workspaceRoot,
+      runtimeDir,
+      () => options.credentialEnv,
+    )
   }
   const linkedWorktree = options.linkedWorktree
   const scrubEnv = options.scrubEnv ?? scrubSponsoredLocalEnv
@@ -2067,9 +2329,20 @@ export function createSponsoredTerminalBroker(
       assertSponsoredCommandCwd(workspaceRoot, request.cwd)
       fs.mkdirSync(home, { recursive: true })
       fs.mkdirSync(tmp, { recursive: true })
-      const env = scrubEnv(request.env, { home, tmp }) as NodeJS.ProcessEnv
+      const env = withSponsoredRunCredentialEnv(
+        scrubEnv(request.env, { home, tmp }),
+        options.credentialEnv,
+      ) as NodeJS.ProcessEnv
+      if (managedBinDirs.length > 0) {
+        env.PATH = [env.PATH, ...managedBinDirs]
+          .filter((item): item is string => Boolean(item))
+          .join(path.delimiter)
+      }
       if (platform === 'darwin' && env.PATH !== undefined) {
         env.PATH = macRunPath(env.PATH)
+      }
+      if (platform === 'linux' && env.PATH !== undefined) {
+        env.PATH = sponsoredLinuxSearchPath(env.PATH)
       }
       // The linked worktree's grant, or nothing at all for a workspace that is
       // its own repository. Computed per start rather than once in the closure
@@ -2081,11 +2354,40 @@ export function createSponsoredTerminalBroker(
         : { readSubpaths: [], writeSubpaths: [], writeLiterals: [] }
       const writeRoots = [workspaceRoot, runtimeDir, ...git.writeSubpaths]
       const readRoots = [...additionalReadRoots, ...git.readSubpaths]
+      // An in-place run may READ the repository (`git status`, `git diff` and
+      // `git log` are how a procedure understands the project) and may write
+      // no part of it: no commit, no ref, and above all no `hooks/` or
+      // `config`, which the orchestrator's own unsandboxed `git -C` would
+      // then execute as the user.
+      const denyWriteSubpaths = options.readOnlyGitDir
+        ? [path.join(workspaceRoot, '.git')]
+        : []
+      // The workspace's secret files are unreadable to every command, on both
+      // arms, whatever the run: the file tools already refuse them.
       if (platform === 'darwin') {
-        return spawnMac(request, writeRoots, env, readRoots, git.writeLiterals)
+        return spawnMac(
+          request,
+          writeRoots,
+          env,
+          readRoots,
+          git.writeLiterals,
+          denyWriteSubpaths,
+          [workspaceRoot],
+          options.spawnProcess,
+        )
       }
       if (platform === 'linux') {
-        return spawnLinux(request, writeRoots, env, readRoots, linkedWorktree)
+        return spawnLinux(
+          request,
+          writeRoots,
+          env,
+          readRoots,
+          linkedWorktree,
+          denyWriteSubpaths,
+          sponsoredSecretFiles(workspaceRoot),
+          new Set(Object.keys(options.credentialEnv ?? {})),
+          options.spawnProcess,
+        )
       }
       throw new Error(
         `A sponsored run cannot be contained on ${platform}, so it will not be started.`,

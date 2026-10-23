@@ -17,6 +17,7 @@ import {
   resolveFreebuffWebModelForLimitedTier,
   FREEBUFF_GEMINI_38_FLASH_MODEL_ID,
   FREEBUFF_MIMO_V26_PRO_MODEL_ID,
+  FREEBUFF_ENABLE_FAST_MODE_IN_UI,
 } from '../freebuff-models'
 import {
   FREEBUFF_SUBSCRIPTION_MODEL_IDS,
@@ -72,9 +73,9 @@ describe('paid plans at limited access', () => {
       'z-ai/glm-5.3-flash',
       'deepseek/deepseek-v4-flash',
     ])
-    expect(FREEBUFF_SUBSCRIPTION_MODEL_IDS.filter(freeAtLimitedTier)).not.toContain(
-      'openai/gpt-5.6-luna',
-    )
+    expect(
+      FREEBUFF_SUBSCRIPTION_MODEL_IDS.filter(freeAtLimitedTier),
+    ).not.toContain('openai/gpt-5.6-luna')
   })
 
   test('a paid plan unlocks exactly the models it meters', () => {
@@ -86,8 +87,7 @@ describe('paid plans at limited access', () => {
   })
 
   test('paying does not unlock anything the plan does not cover', () => {
-    // The god-only ids are the case that matters: a plan must never be a
-    // way into a model nobody sells.
+    // A plan unlocks only the rows it covers.
     expect(
       isFreebuffSessionModelAllowedForAccessTier(
         'openai/gpt-5.6-luna-es',
@@ -109,17 +109,23 @@ describe('paid plans at limited access', () => {
     }
   })
 
-  test('GPT-6 Luna is US-or-paid, and 5.6 is retired from the catalog', () => {
+  test('GPT-6 Luna is open at full access and plan-only at limited, and 5.6 is retired', () => {
     // 5.6's old shape (free at full access, plan-locked at limited) is gone
     // with the row: it left FREEBUFF_MODELS on 2026-09-22.
     expect(FREEBUFF_MODELS.map((m) => m.id)).not.toContain(
       FREEBUFF_GPT_5_6_LUNA_MODEL_ID,
     )
-    // Its replacement is paid-only at every tier unless the viewer is in the
-    // US, which only the server can know — so the catalog lists it here.
-    expect(FREEBUFF_SUBSCRIPTION_PRO_MODEL_IDS).toContain(
+    // Its replacement is open to every full-access account since 2026-09-25
+    // (US-or-paid before), so it is not a globally paid-only row.
+    expect(FREEBUFF_SUBSCRIPTION_PRO_MODEL_IDS).not.toContain(
       FREEBUFF_GPT_6_LUNA_MODEL_ID,
     )
+    expect(
+      isFreebuffSessionModelAllowedForAccessTier(
+        FREEBUFF_GPT_6_LUNA_MODEL_ID,
+        'full',
+      ),
+    ).toBe(true)
     expect(FREEBUFF_LIMITED_TIER_PLAN_ONLY_MODEL_IDS).toContain(
       FREEBUFF_GPT_6_LUNA_MODEL_ID,
     )
@@ -154,8 +160,15 @@ describe('paid plans at limited access', () => {
     // Pinned so that adding a row to a plan is a decision somebody states
     // here, not a diff that passes quietly.
     // MiMo 2.6 Pro joined on 2026-09-21, on Luna's terms (plan-only at
-    // limited access, Freebucks at full).
-    expect(FREEBUFF_SUBSCRIPTION_MODEL_IDS).toHaveLength(6)
+    // limited access, Freebucks at full). Muse Spark 1.3 joined on 2026-09-28,
+    // paid-only on every surface, and GPT-6.1 Sol on 2026-09-29 on the same
+    // terms. Kimi K3 (CrofAI) left on 2026-10-01: its provider is retired and
+    // no picker lists it. DeepSeek Flash fast mode joined on 2026-10-05 on
+    // MiMo 2.6 Pro's terms, with its picker row behind the UI switch.
+    // Gemini 4 Argon joined on 2026-10-13 on Sol's terms.
+    expect(FREEBUFF_SUBSCRIPTION_MODEL_IDS).toHaveLength(
+      FREEBUFF_ENABLE_FAST_MODE_IN_UI ? 9 : 8,
+    )
   })
 
   test('a limited-tier plan-only row is never free at limited access', () => {
@@ -240,7 +253,7 @@ describe('a plan model survives resolution, not just the allowlist', () => {
     }
   })
 
-  test('the CLI/Desktop tier catalog gains the plan rows and keeps the free ones', () => {
+  test('the CLI/Desktop tier catalog lists the plan rows to everyone and keeps the free ones first', () => {
     const free = getFreebuffModelsForAccessTier('limited').map((m) => m.id)
     const paid = getFreebuffModelsForAccessTier('limited', true).map(
       (m) => m.id,
@@ -249,8 +262,11 @@ describe('a plan model survives resolution, not just the allowlist', () => {
     // what the account can still run for free has to stay on offer.
     for (const id of free) expect(paid).toContain(id)
     expect(paid.slice(0, free.length)).toEqual(free)
-    // And it gained at least one row it could not pick before.
-    expect(paid.length).toBeGreaterThan(free.length)
+    // The plan rows are LISTED whether or not there is a plan (2026-09-30):
+    // a plan decides whether they are locked (`freebuffPlanRequired`), not
+    // whether they are drawn, so the upgrade has a row to point at.
+    expect(paid).toEqual(free)
+    expect(free.length).toBeGreaterThan(LIMITED_FREEBUFF_MODEL_IDS.length)
     for (const id of paid) {
       expect(
         isFreebuffSessionModelAllowedForAccessTier(id, 'limited', true),

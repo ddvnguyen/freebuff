@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { spawnSync } from 'child_process'
+import { spawn, spawnSync } from 'child_process'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
@@ -18,10 +18,16 @@ import {
   findXcodeDeveloperGit,
   linkDeveloperShims,
   sponsoredCodeSearchFlagsRefusal,
+  sponsoredLinuxEnvArgs,
+  sponsoredLinuxResolverMounts,
   sponsoredMacGitPath,
   sponsoredMacProfile,
+  sponsoredMacSecretReadRules,
+  sponsoredSecretFiles,
 } from '../tools/sponsored-sandbox'
-import { codeSearch, parseCodeSearchFlags } from '../tools/code-search'
+import { parseCodeSearchFlags } from '@codebuff/common/util/code-search-flags'
+import { codeSearch } from '../tools/code-search'
+import { probeSponsoredRuntimes } from '../tools/sponsored-runtimes'
 import { sponsoredContainmentTestGate } from '../../test/sponsored-containment-gate'
 
 /**
@@ -157,6 +163,110 @@ describe('sponsored local environment (COD-336 acceptance 4)', () => {
       }
     },
   )
+})
+
+describe('connected run credentials (COD-665)', () => {
+  const KEY = 'sk_test_connect_1234567890'
+
+  containedIt(
+    'a real shell sees exactly the declared variable, with the connected value, and no host credential',
+    async () => {
+      const { root, runtime, parent } = workspace()
+      try {
+        const handle = createSponsoredTerminalBroker({
+          workspaceRoot: root,
+          runtimeDir: runtime,
+          credentialEnv: { SIEVE_API_KEY: KEY },
+        }).start({
+          executable: 'bash',
+          args: [
+            '-c',
+            'echo "SIEVE=${SIEVE_API_KEY:-absent}"; echo "GH=${GITHUB_TOKEN:-absent}"; echo "HOME=$HOME"',
+          ],
+          cwd: root,
+          // The host's OWN value of the same name is not what the run gets.
+          env: {
+            ...POLLUTED_ENV,
+            SIEVE_API_KEY: 'from-the-host-shell',
+          } as NodeJS.ProcessEnv,
+        })
+        const stdout = drain(handle.stdout)
+        await handle.completion
+        const output = await stdout
+        expect(output).toContain(`SIEVE=${KEY}`)
+        expect(output).not.toContain('from-the-host-shell')
+        expect(output).toContain('GH=absent')
+        expect(output).toContain(`HOME=${path.join(runtime, 'home')}`)
+      } finally {
+        fs.rmSync(parent, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('refuses to start a command with an undeclarable credential name', () => {
+    const { root, runtime, parent } = workspace()
+    try {
+      const broker = createSponsoredTerminalBroker({
+        workspaceRoot: root,
+        runtimeDir: runtime,
+        // Linux or macOS both build the env before choosing a sandbox, so
+        // the refusal is the same whichever this host is.
+        platform: process.platform === 'linux' ? 'linux' : 'darwin',
+        credentialEnv: { NODE_OPTIONS: '--require=/tmp/evil.js' },
+      })
+      expect(() =>
+        broker.start({
+          executable: 'bash',
+          args: ['-c', 'true'],
+          cwd: root,
+          env: POLLUTED_ENV as NodeJS.ProcessEnv,
+        }),
+      ).toThrow(/not a declarable credential name/)
+    } finally {
+      fs.rmSync(parent, { recursive: true, force: true })
+    }
+  })
+
+  it('bubblewrap never carries a credential value in its argv', () => {
+    const env = {
+      PATH: '/usr/bin',
+      HOME: '/run/home',
+      SIEVE_API_KEY: KEY,
+    }
+    const { args, spawnEnv } = sponsoredLinuxEnvArgs(
+      env,
+      new Set(['SIEVE_API_KEY']),
+    )
+    // /proc/<pid>/cmdline is world-readable; /proc/<pid>/environ is not.
+    expect(args.join('\0')).not.toContain(KEY)
+    expect(args).not.toContain('--clearenv')
+    expect(spawnEnv).toEqual({ PATH: '/usr/bin', SIEVE_API_KEY: KEY })
+    // Everything else is still a --setenv, which overrides bwrap's own env.
+    expect(args).toEqual([
+      '--setenv',
+      'PATH',
+      '/usr/bin',
+      '--setenv',
+      'HOME',
+      '/run/home',
+    ])
+  })
+
+  it('with no credentials the bubblewrap env argv is exactly what it always was', () => {
+    const env = { PATH: '/usr/bin', HOME: '/run/home', UNSET: undefined }
+    expect(sponsoredLinuxEnvArgs(env)).toEqual({
+      args: [
+        '--clearenv',
+        '--setenv',
+        'PATH',
+        '/usr/bin',
+        '--setenv',
+        'HOME',
+        '/run/home',
+      ],
+      spawnEnv: { PATH: '/usr/bin' },
+    })
+  })
 })
 
 describe('sponsored write containment (COD-336 acceptance 3)', () => {
@@ -647,6 +757,100 @@ describe('sponsored read containment (F1)', () => {
   })
 })
 
+describe('secrets inside the workspace: the shell refuses what the file tools refuse', () => {
+  const SECRETS: Record<string, string> = {
+    '.env': 'REAL_VALUE_ENV',
+    '.env.local': 'REAL_VALUE_LOCAL',
+    'apps/web/.env.production': 'REAL_VALUE_NESTED',
+    '.npmrc': 'REAL_VALUE_NPMRC',
+    id_rsa: 'REAL_VALUE_KEY',
+    'certs/server.pem': 'REAL_VALUE_PEM',
+    '.envrc': 'REAL_VALUE_DIRENV',
+    // Inside the repository's own directory, which the Linux scan must walk.
+    '.git/deploy.key': 'REAL_VALUE_GIT',
+  }
+  function withSecrets(root: string): void {
+    for (const [file, body] of Object.entries(SECRETS)) {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true })
+      fs.writeFileSync(path.join(root, file), `${body}\n`)
+    }
+    fs.writeFileSync(path.join(root, '.env.example'), 'TEMPLATE_NAME=\n')
+    fs.mkdirSync(path.join(root, 'src'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'src', 'app.ts'), 'ORDINARY_CODE\n')
+  }
+
+  containedIt(
+    'a contained shell reads no secret, and still reads templates and code',
+    async () => {
+      const { root, runtime, parent } = workspace()
+      withSecrets(root)
+      try {
+        const reads = [...Object.keys(SECRETS), '.env.example', 'src/app.ts']
+          .map((file) => `cat ${JSON.stringify(file)} 2>/dev/null`)
+          .join('; ')
+        // And by renaming it first: a rename is a write on the source path,
+        // and a read-only deny let `mv` hand the value to an innocent name.
+        const { out } = await runInSandbox(
+          { workspaceRoot: root, runtimeDir: runtime, readOnlyGitDir: true },
+          root,
+          `${reads}; mv .env.local moved 2>/dev/null && cat moved 2>/dev/null; true`,
+        )
+        expect(out).not.toContain('REAL_VALUE')
+        expect(out).toContain('TEMPLATE_NAME=')
+        expect(out).toContain('ORDINARY_CODE')
+        expect(fs.readFileSync(path.join(root, '.env.local'), 'utf8')).toBe(
+          'REAL_VALUE_LOCAL\n',
+        )
+      } finally {
+        fs.rmSync(parent, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('the Linux scan finds exactly the files the read policy refuses', () => {
+    const { root, parent } = workspace()
+    withSecrets(root)
+    // Not walked: dependencies (public package content) and the object store.
+    fs.mkdirSync(path.join(root, 'node_modules', 'pkg'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'node_modules', 'pkg', '.env'), 'x')
+    fs.mkdirSync(path.join(root, '.git', 'objects'), { recursive: true })
+    fs.writeFileSync(path.join(root, '.git', 'objects', 'x.key'), 'x')
+    try {
+      expect(
+        sponsoredSecretFiles(root).map((file) => path.relative(root, file)),
+      ).toEqual(Object.keys(SECRETS).sort())
+      // A bound, and past it a refusal rather than a partial mask.
+      expect(() => sponsoredSecretFiles(root, 3)).toThrow(/too large/)
+    } finally {
+      fs.rmSync(parent, { recursive: true, force: true })
+    }
+  })
+
+  it('the macOS rules deny after allowing, escape the root, and fold case', () => {
+    const { root, runtime, parent } = workspace()
+    try {
+      const profile = sponsoredMacProfile([root, runtime], [], [], [], [root])
+      const lines = profile.split('\n')
+      const denyAt = lines.findIndex((line) =>
+        line.startsWith('(deny file-read*'),
+      )
+      expect(denyAt).toBeGreaterThan(
+        lines.findIndex((line) => line.startsWith('(allow file-read*')),
+      )
+      // The templates are granted back AFTER the deny.
+      expect(lines[denyAt + 1]).toContain('[eE][xX][aA][mM][pP][lL][eE]')
+      const rules = sponsoredMacSecretReadRules('/tmp/a.b(c)+d').join('\n')
+      expect(rules).toContain('^/tmp/a\\.b\\(c\\)\\+d/')
+      expect(rules).toContain('\\.[eE][nN][vV]')
+      expect(() => sponsoredMacSecretReadRules('/tmp/"quote')).toThrow(
+        /quote/,
+      )
+    } finally {
+      fs.rmSync(parent, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('sponsored code search process containment', () => {
   it('cannot smuggle --pre through a quoted glob value', () => {
     const flags = "-g 'x --pre /bin/cat'"
@@ -703,9 +907,29 @@ describe('sponsored code search process containment', () => {
   )
 })
 
-// ---------------------------------------------------------- F2 loopback deny
+// ---------------------------------------------------------- network policy
 
-describe('sponsored loopback containment (F2)', () => {
+describe('sponsored network access', () => {
+  it('mounts a resolver symlink target without exposing its parent directory', () => {
+    const { root, parent } = workspace()
+    try {
+      const resolver = path.join(root, 'resolv.conf')
+      expect(sponsoredLinuxResolverMounts(resolver)).toEqual([])
+      fs.writeFileSync(resolver, 'nameserver 127.0.0.53\n')
+      const target = fs.realpathSync(resolver)
+      expect(sponsoredLinuxResolverMounts(target)).toEqual([])
+      const link = path.join(parent, 'resolv.conf')
+      fs.symlinkSync(resolver, link)
+      expect(sponsoredLinuxResolverMounts(link)).toEqual([
+        '--ro-bind',
+        target,
+        target,
+      ])
+    } finally {
+      fs.rmSync(parent, { recursive: true, force: true })
+    }
+  })
+
   it('denies loopback in the macOS profile while keeping egress', () => {
     const profile = sponsoredMacProfile(['/tmp/ws'], [])
     expect(profile).toContain('(allow network*)')
@@ -719,39 +943,69 @@ describe('sponsored loopback containment (F2)', () => {
     )
   })
 
-  containedIt('cannot reach a listener on this machine', async () => {
-    const server = Bun.serve({
-      port: 0,
-      hostname: '127.0.0.1',
-      fetch: () => new Response('ORCHESTRATOR-REACHED'),
-    })
-    const { root, runtime, parent } = workspace()
-    try {
-      const handle = createSponsoredTerminalBroker({
-        workspaceRoot: root,
-        runtimeDir: runtime,
-      }).start({
-        executable: 'bash',
-        args: [
-          '-c',
-          `curl -s --max-time 4 http://127.0.0.1:${server.port}/ || echo BLOCKED`,
-        ],
-        cwd: root,
-        env: POLLUTED_ENV as NodeJS.ProcessEnv,
+  containedIt(
+    'shares host networking on Linux and denies host loopback on macOS',
+    async () => {
+      const server = Bun.serve({
+        port: 0,
+        hostname: '127.0.0.1',
+        fetch: () => new Response('ORCHESTRATOR-REACHED'),
       })
-      const stdout = drain(handle.stdout)
-      const stderr = drain(handle.stderr)
-      await handle.completion
-      await stderr
-      // The orchestrator's API pushes branches and opens pull requests with
-      // the user's real credentials. A sandbox that can reach its own
-      // supervisor contains nothing.
-      expect(await stdout).not.toContain('ORCHESTRATOR-REACHED')
-    } finally {
-      server.stop(true)
-      fs.rmSync(parent, { recursive: true, force: true })
-    }
-  })
+      const { root, runtime, parent } = workspace()
+      try {
+        const handle = createSponsoredTerminalBroker({
+          workspaceRoot: root,
+          runtimeDir: runtime,
+        }).start({
+          executable: 'bash',
+          args: [
+            '-c',
+            `curl -s --max-time 4 http://127.0.0.1:${server.port}/ || echo BLOCKED`,
+          ],
+          cwd: root,
+          env: POLLUTED_ENV as NodeJS.ProcessEnv,
+        })
+        const stdout = drain(handle.stdout)
+        const stderr = drain(handle.stderr)
+        await handle.completion
+        await stderr
+        // A local listener makes this independent of public network uptime.
+        // The old isolated Linux network namespace cannot reach this listener.
+        if (process.platform === 'linux')
+          expect(await stdout).toBe('ORCHESTRATOR-REACHED')
+        else expect(await stdout).not.toContain('ORCHESTRATOR-REACHED')
+      } finally {
+        server.stop(true)
+        fs.rmSync(parent, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it.skipIf(!CONTAINMENT_USABLE || process.platform !== 'linux')(
+    'keeps the host resolver readable inside the Linux sandbox',
+    async () => {
+      const { root, runtime, parent } = workspace()
+      try {
+        const resolver = fs.readFileSync('/etc/resolv.conf', 'utf8')
+        const handle = createSponsoredTerminalBroker({
+          workspaceRoot: root,
+          runtimeDir: runtime,
+        }).start({
+          executable: '/bin/cat',
+          args: ['/etc/resolv.conf'],
+          cwd: root,
+          env: POLLUTED_ENV as NodeJS.ProcessEnv,
+        })
+        const stdout = drain(handle.stdout)
+        const stderr = drain(handle.stderr)
+        await handle.completion
+        expect(await stderr).toBe('')
+        expect(await stdout).toBe(resolver)
+      } finally {
+        fs.rmSync(parent, { recursive: true, force: true })
+      }
+    },
+  )
 })
 
 // ------------------------------------------------- the layout Desktop creates
@@ -1625,5 +1879,86 @@ describe('the shell selector is readable, and nothing around it is', () => {
         fs.rmSync(parent, { recursive: true, force: true })
       }
     },
+  )
+})
+
+/**
+ * COD-829: the capability report's `availableRuntimes` is asked of the run's
+ * own sandbox. A runtime installed under a folder the sandbox does not grant
+ * (nvm, mise, volta under the home folder) is on the host's PATH and must
+ * read as MISSING, because the run will not be able to start it.
+ */
+describe('available runtimes, as the sandbox sees them (COD-829)', () => {
+  function fakeRuntime(dir: string, name: string): void {
+    fs.mkdirSync(dir, { recursive: true })
+    const file = path.join(dir, name)
+    fs.writeFileSync(file, '#!/bin/sh\necho 1.0.0\n')
+    fs.chmodSync(file, 0o755)
+  }
+
+  it('the uncontained probe sees a runtime on PATH', async () => {
+    const { parent, root } = workspace()
+    try {
+      const bin = path.join(parent, 'hidden-toolchain', 'bin')
+      fakeRuntime(bin, 'bun')
+      const direct = {
+        start: (request: {
+          executable: string
+          args: string[]
+          cwd: string
+          env: NodeJS.ProcessEnv
+        }) => {
+          const child = spawn(request.executable, request.args, {
+            cwd: request.cwd,
+            env: request.env,
+          })
+          return {
+            pid: child.pid,
+            stdout: child.stdout,
+            stderr: child.stderr,
+            completion: new Promise<number | null>((resolve) =>
+              child.on('close', (code: number | null) => resolve(code)),
+            ),
+            kill: (signal: NodeJS.Signals) => child.kill(signal),
+            isAlive: () => child.exitCode === null,
+          }
+        },
+      }
+      const runtimes = await probeSponsoredRuntimes(direct, {
+        cwd: root,
+        env: { PATH: `${bin}:/usr/bin:/bin` },
+      })
+      expect(runtimes).toContain('bun')
+    } finally {
+      fs.rmSync(parent, { recursive: true, force: true })
+    }
+  })
+
+  containedIt(
+    'the contained probe reports a home-folder runtime as missing',
+    async () => {
+      const { parent, root, runtime } = workspace()
+      try {
+        // Outside every read root the sandbox grants, like ~/.bun/bin.
+        const bin = path.join(parent, 'hidden-toolchain', 'bin')
+        fakeRuntime(bin, 'bun')
+        const broker = createSponsoredTerminalBroker({
+          workspaceRoot: root,
+          runtimeDir: runtime,
+        })
+        const runtimes = await probeSponsoredRuntimes(broker, {
+          cwd: root,
+          env: { PATH: `${bin}:/usr/bin:/bin` },
+          timeoutMs: 15_000,
+        })
+        // The probe ran to its end inside the sandbox...
+        expect(runtimes).toBeDefined()
+        // ...and could not start what only the host could see.
+        expect(runtimes).not.toContain('bun')
+      } finally {
+        fs.rmSync(parent, { recursive: true, force: true })
+      }
+    },
+    20_000,
   )
 })

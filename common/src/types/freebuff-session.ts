@@ -3,6 +3,18 @@ import type { FreebuffDesktopConcurrency } from '../constants/freebuff-model-ent
 import type { FreebuffStandingInfo } from '../constants/freebuff-standing'
 import { applyFreebucksPriceChanges } from '../util/freebuff-price-changes'
 
+/** Confirmed Freebucks returned to each original funding source. */
+export interface FreebuffFreebucksRefundSources {
+  daily: number
+  wallet: number
+}
+
+/** A settled session refund: the unused part of a purchased hour, returned
+ *  when the hour ended. `id` is stable, so a client can tell a new one. */
+export interface FreebuffFreebucksRefund extends FreebuffFreebucksRefundSources {
+  id: string
+}
+
 /**
  * Wire-level shapes returned by `/api/v1/freebuff/session`. Source of truth
  * for the CLI (which deserializes these) and the server (which serializes
@@ -32,7 +44,7 @@ export interface FreebuffSessionEntitlementBreakdown {
   promo?: number
   /**
    * Sessions added by the account's earned LEVEL
-   * (`common/constants/freebuff-levels.ts`). Omitted at level 0, which is
+   * (retired; `docs/freebuff-levels.md`). Omitted at level 0, which is
    * where every account starts, so the field is absent for most callers and an
    * older client that never reads it still sums to the right `limit` — the
    * server always sends the total.
@@ -136,7 +148,7 @@ export interface FreebuffSubscriptionUsage {
    * free pool is spent the free figures are simply not on the wire, and a
    * client trying to add "free + plan" from it double-counts the plan row.
    *
-   * Reported for quota-exempt accounts (god/admin) too: their free pool is not
+   * Reported for quota-exempt accounts too: their free pool is not
    * ENFORCED, but the entitlement is still the honest free half of the combined
    * figure. Absent entirely from servers older than this field.
    *
@@ -158,8 +170,13 @@ export interface FreebuffSubscriptionUsage {
 export interface FreebuffFreebucksWindow {
   /** Freebucks granted for the account's day: the access tier's free pool, or
    *  the plan's daily pool for a subscriber (the plan REPLACES the free
-   *  figure rather than stacking on it). */
+   *  figure rather than stacking on it), plus `streakBonus`. */
   limit: number
+  /** The part of `limit` today's streak added (15 per streak day granted in
+   *  this interval). Expires with the pool at `resetAt`; never in the wallet.
+   *  Absent when zero or from an older server. `limit - streakBonus` is the
+   *  plan's own daily figure. */
+  streakBonus?: number
   /** Freebucks already spent from the daily pool today. */
   spent: number
   /** `limit - spent`, floored at zero so a lowered allowance reads as 0. */
@@ -167,6 +184,10 @@ export interface FreebuffFreebucksWindow {
   /** ISO instant the pool refills. */
   resetAt: string
   resetTimeZone?: string
+  /** Why the pool is this size, when the user can do something about it —
+   *  today only the smaller free pool on a VPN or proxy. Server-resolved
+   *  copy; absent means nothing to explain. */
+  note?: string
 }
 
 /**
@@ -175,7 +196,7 @@ export interface FreebuffFreebucksWindow {
  * because the distinction is ours to keep rather than the user's to track:
  * EARNED ones (bounties, referrals, grants) stay until they are spent, while a
  * plan's monthly bonus is an allowance for its period and any of it left over
- * is retired when another period’s bonus is credited, including on upgrade
+ * is retired when the next month’s bonus is credited, but not on an upgrade
  * (`FREEBUCKS_BONUS_EXPIRY_REASON`). Subscription end alone does not retire it.
  * Wallet spending is attributed to the expiring half first, so a user who spends is always
  * treated as having spent the money that was about to go.
@@ -189,6 +210,10 @@ export interface FreebuffFreebucksWallet {
   balance: number
   /** Freebucks the plan credits here once per billing period (0 on free). */
   monthlyBonus: number
+  /** Current credited monthly allowance, separate from earned/bought wallet
+   *  funds. Uses the bonus rollover's spending attribution. Absent when the
+   *  current bonus is not known or from a server without this projection. */
+  monthlyUsage?: { limit: number; spent: number; remaining: number }
   /** Current period end: the next bonus is available then IF the plan renews.
    * Still present when cancellation is scheduled; absent without a live plan. */
   nextBonusAt?: string
@@ -197,8 +222,7 @@ export interface FreebuffFreebucksWallet {
 /**
  * The hard daily dollar ceiling behind the Freebucks meter.
  *
- * NOT SHOWN ANYWHERE, and that is the point: it is an abuse backstop sized to
- * catch only the heaviest days, while the meter a user plans against is their
+ * Not shown in the clients: the meter a user plans against is their
  * Freebucks. Rendering a second, smaller-looking limit beside the pool invited
  * the reading that the dollars run out first. It stays on the wire because a
  * refusal names it and an operator surface may want it, and it deliberately
@@ -271,34 +295,49 @@ export interface FreebuffFreebucksInfo {
   spend?: FreebuffFreebucksSpendCeiling
   /** @deprecated Legacy cap field; new servers omit it and clients ignore it. */
   monthly?: FreebuffFreebucksMonthlyAllowance
+  /** The account's most recent session refund from the last day. Clients
+   *  announce an id they have not seen before; the first snapshot is history. */
+  lastRefund?: FreebuffFreebucksRefund
+  /**
+   * The server's verdict that this viewer is never asked before an hour is
+   * bought (full access, 2026-10-16: the meter should feel unlimited). Pickers
+   * skip the wallet and model-switch questions, and an hour that ran out
+   * renews on the next send or mid-turn. Absent keeps every question.
+   */
+  spendWithoutAsking?: boolean
+  /**
+   * Freebucks a session started now takes off its price: present at full
+   * access while no session of the account is live. Pickers lock a row on
+   * `price - soloDiscount`; `prices` stay at list.
+   */
+  soloDiscount?: number
+  /**
+   * Rows on which this viewer is not shown the session clock (2026-10-21:
+   * full access in tiers 1 and 2, on a row of five hours or less). Clients
+   * draw no time left, countdown or hour-end notice for a session on one.
+   * Sent only beside `spendWithoutAsking`, so an hour that runs out renews
+   * without a question. Display only: the session is still an hour. Absent
+   * keeps every clock.
+   */
+  untimedModelIds?: readonly string[]
   /** The plan the daily pool and bonus were sized from; null on free. */
   planId: string | null
   /** Session price per model id. Only models on the meter appear here. */
   prices: Record<string, number>
   /**
-   * The list price per model id BEFORE the first-tab discount, so a client
-   * can cross it out beside the discounted `prices` entry. Present only on a
-   * quote that carries `firstTabDiscount`; it equals `prices` while the
-   * discount is unavailable. Never used for admission or charging.
+   * The regular price per model id for a row a catalog discount moved, so a
+   * client can cross it out beside the discounted `prices` entry. Never used
+   * for admission or charging.
    */
   listPrices?: Record<string, number>
-  /** Account-wide first-tab offer. Prices already include it when available. */
-  firstTabDiscount?: {
-    amount: number
-    available: boolean
-    holder?: {
-      instanceId: string | null
-      surface: 'desktop' | 'single'
-      expiresAt: string
-    }
-  }
   /**
    * Rows THIS viewer must buy a plan to open, decided by the server.
    *
    * On the wire for the reason `upgrade` is: the decision turns on the
-   * viewer's resolved COUNTRY (FREEBUFF_US_OR_PAID_MODEL_IDS — US or paid),
-   * and no client is told its country on a full-access session. A client
-   * deciding this for itself would be reading its own belief.
+   * access tier this request resolved to (limited access also locks
+   * FREEBUFF_LIMITED_TIER_PLAN_ONLY_MODEL_IDS; until 2026-09-25 it turned on
+   * the COUNTRY, US or paid). A client deciding this for itself would be
+   * reading its own belief.
    *
    * Absent (an older server, or a viewer no row is gated for) means "fall back
    * to the static paid-only list", which is what every client did before
@@ -315,7 +354,7 @@ export interface FreebuffFreebucksInfo {
    *  and priceChanges; retained for older server responses. */
   peak?: FreebuffFreebucksPeak
   /** Server-owned recurring prices for new sessions. Clients project this policy
-   *  into `prices` (including first-tab discounts) even when refreshes fail.
+   *  into `prices` even when refreshes fail.
    *  A fresh response replaces the policy; admitted charges never change. */
   offPeak?: Record<string, FreebuffOffPeakPrice>
   /** Scheduled changes announced by the server; do not reprice admitted sessions. */
@@ -331,6 +370,13 @@ export interface FreebuffFreebucksInfo {
    * that predates the field.
    */
   upgrade?: FreebuffFreebucksUpgrade
+  /**
+   * The server's verdict that this account is shown no upgrade button, not
+   * even a subscriber's next plan up (2026-10-22: full access in tiers 1 and
+   * 2, whose pools cover most use). Overrides `upgrade`. Absent keeps the
+   * button.
+   */
+  upgradeHidden?: boolean
 }
 
 export interface FreebuffFreebucksUpgrade {
@@ -359,8 +405,15 @@ export interface FreebuffOffPeakPrice {
   /** UTC hours, daily [start, end); end may be on the next day. */
   startHourUtc: number
   endHourUtc: number
+  /** When true, Saturday and Sunday in Beijing (Friday 16:00 to Sunday
+   *  16:00 UTC) are off-peak all day as well, as on DeepSeek's own rate card.
+   *  Absent means the daily window alone. */
+  weekendsOffPeak?: boolean
   price: number
   regularPrice: number
+  /** Why the price moves, as a clause after the hours: "when Freebuff is
+   *  quiet". Absent on older servers; the copy then gives hours alone. */
+  reason?: string
 }
 
 export interface FreebuffPriceChange {
@@ -390,10 +443,22 @@ export interface FreebuffSubscriptionInfo {
   billingInterval?: 'monthly' | 'yearly'
   /** Stripe paid-through/renewal instant, distinct from monthly usage reset. */
   renewsAt?: string
+  /** Billing-page-only preview from Stripe; never inferred from offer eligibility. */
+  retentionDiscount?:
+    | { status: 'applied'; percentOff: number; appliesAt: string }
+    | { status: 'unavailable' }
+    | null
   /** Present only while subscribed. */
   usage?: FreebuffSubscriptionUsage
-  /** Raw Stripe status, so a client can surface a failed payment. */
+  /** Raw Stripe status of the live plan. */
   status?: string
+  /**
+   * The plan paused because its renewal payment failed. While set, `tierId` is
+   * null (the account is metered as free) and paying the open invoice restores
+   * the plan; clients send the user to the account page's Pay button. Absent
+   * otherwise, and from servers older than this field.
+   */
+  paymentFailedTierId?: string
   /** True when the subscription lapses at period end. */
   cancelAtPeriodEnd?: boolean
   /** Tier this drops to at the next renewal, when a downgrade is scheduled.
@@ -425,9 +490,8 @@ export interface FreebuffSubscriptionInfo {
  * has always drawn, base + level + referral bonus. `week` and `month` are the
  * MARKETED free allowance (`FREEBUFF_FREE_TIER_ALLOWANCE`) with the account's
  * real usage against them, so free users see the same three rings a
- * subscriber sees. DISPLAY-ONLY for now: nothing refuses on the week or month
- * yet (operator decision — enforcement is a later change), so `weekUsed` can
- * legitimately exceed `weekLimit` until it lands.
+ * subscriber sees. `weekUsed` can exceed `weekLimit`; clients must render
+ * that without assuming the two are clamped.
  *
  * Absent for quota-exempt accounts (they hold no pools), for limited access
  * (whose one regional pool is already the picker's ring), and from servers
@@ -573,7 +637,7 @@ export interface FreebuffReferralInfo {
    *  so this is the same instant at either tier. */
   resetAt?: string
   /** Whether the current user has a GitHub account linked. Referrals only
-   *  qualify with a connected, sufficiently-old GitHub, so the CLI prompts
+   *  qualify with a connected GitHub account, so the CLI prompts
    *  Google-only users to connect one. */
   githubLinked: boolean
 }
@@ -747,67 +811,6 @@ export type FreebuffIpPrivacySignal =
   | 'hosting'
   | 'service'
 
-export type FreebuffSpurStatus =
-  | 'not_checked'
-  | 'clean'
-  | 'suspicious'
-  | 'failed'
-  /**
-   * Deliberately not consulted: the provider is switched off, or its balance
-   * is exhausted and the breaker is open.
-   *
-   * Distinct from `failed` on purpose. `failed` means "we asked and got
-   * nothing", which is a signal about the IP's luck and is worth a risk-score
-   * floor. `skipped` means "we chose not to ask", which says nothing about the
-   * IP at all — scoring it would penalise every request in the world the
-   * moment we turn a vendor off. What it does instead is leave the escalation
-   * UNRESOLVED when no other provider answered, which the spend ceiling reads
-   * as `unverified_egress`.
-   */
-  | 'skipped'
-
-export type FreebuffScamalyticsStatus =
-  | 'not_checked'
-  | 'clean'
-  | 'suspicious'
-  | 'failed'
-  /** Deliberately not consulted — switched off, or balance exhausted and the
-   *  breaker is open. Same meaning and same reasoning as the Spur variant. */
-  | 'skipped'
-
-export type FreebuffPrivacyDecision =
-  | 'allowed_clean'
-  | 'ipinfo_suspicious_spur_clean'
-  | 'corroborated_block'
-  | 'cloudflare_tor_block'
-  | 'spur_failed_limited'
-  /** ipinfo flagged the egress and no second opinion was obtainable at all —
-   *  every provider disabled, exhausted, or erroring. Carries the restricted
-   *  spend ceiling so a vendor outage cannot widen anyone's budget. */
-  | 'unverified_egress_limited'
-  | 'scamalytics_failed_limited'
-  | 'scamalytics_suspicious_limited'
-  /** Spur named the tunnel, or placed an ipinfo-named anonymizer in a
-   *  datacenter, and Scamalytics did not flag it. */
-  | 'spur_suspicious_limited'
-  /** ipinfo flagged the IP and the device clock places the user in another
-   *  country; no provider saw a direct line. */
-  | 'client_hints_limited'
-  | 'ipinfo_failed_limited'
-  | 'limited_other'
-
-export type FreebuffPrivacyProviderDecision =
-  | 'not_checked'
-  | 'cloudflare_tor'
-  | 'ipinfo_clean'
-  | 'ipinfo_failed'
-  | 'ipinfo_only'
-  | 'spur_failed'
-  | 'scamalytics_failed'
-  | 'scamalytics_only'
-  | 'corroborated_soft'
-  | 'corroborated_hard'
-
 export interface FreebuffLimitedModeReason {
   /** Present for limited access so the model picker can explain why the
    *  reduced model set is shown without re-running geo/IP logic locally. */
@@ -816,27 +819,7 @@ export interface FreebuffLimitedModeReason {
   ipPrivacySignals?: FreebuffIpPrivacySignal[] | null
 }
 
-/** Permission for one requested session: a wallet ceiling, or explicit consent
- * to its current price when the balance/quote was unavailable. Absence is zero. */
-export type FreebuffWalletSpendLimit = number | 'session'
-
-export interface FreebuffWalletConsent {
-  price: number
-  walletSpend: number
-}
-
 export type FreebuffSessionAdmissionResponse = (
-  | {
-      status: 'first_tab_discount_changed'
-      accessTier?: FreebuffAccessTier
-      freebucks: FreebuffFreebucksInfo | null
-    }
-  | {
-      status: 'consent_required'
-      accessTier?: FreebuffAccessTier
-      walletConsent: FreebuffWalletConsent
-      freebucks: null
-    }
   | ({
       /** User has no session row. CLI must POST to start a session. Also
        *  returned when `getSessionState` notices the user has been swept past
@@ -916,9 +899,12 @@ export type FreebuffSessionAdmissionResponse = (
        *  client may also synthesize a no-grace `{ status: 'ended' }` when a
        *  poll reveals the row was swept. Both render the same UI. */
       status: 'ended'
-      /** Final early-end refund receipt, including zero; retries return the same amount. */
+      /** Final end receipt, including zero; retries return the same amount.
+       *  An end keeps the hour, so this is 0 unless the purchase already settled. */
       freebucksRefund?: number
-      /** Final usage is still outstanding; replay DELETE with the same instance for its receipt. */
+      /** The original funding sources restored by the confirmed refund. */
+      freebucksRefundSources?: FreebuffFreebucksRefundSources
+      /** Settlement is outstanding; replay DELETE with the same instance for its receipt. */
       freebucksRefundPending?: boolean
       accessTier?: FreebuffAccessTier
       instanceId?: string
@@ -1039,6 +1025,15 @@ export type FreebuffSessionAdmissionResponse = (
        * reader takes as the model being down and switches away from.
        */
       purchasesPaused?: boolean
+      /**
+       * The model's daily session limit is spent (FREEBUFF_DAILY_SESSION_LIMITS:
+       * GPT-6.1 Sol and Gemini 4 Argon, one a day). A STOP, never a fallback: the user asked for
+       * this model, was quoted its price, and must be told it is used up rather
+       * than be moved onto a different model (2026-09-30, a CLI user quoted
+       * Sol's price and silently re-admitted on MiMo). `availableHours` says
+       * when it opens again.
+       */
+      dailyLimitReached?: boolean
     }
   | {
       /** Account is banned. Returned from every endpoint so banned bots can't
@@ -1115,6 +1110,20 @@ export type FreebuffSessionAdmissionResponse = (
       retryAfterMs: number
       /** The way out of this refusal, when there is one to sell. */
       upgrade?: FreebuffUpgradeHint
+      /** Not a budget: the account must verify something before it can start
+       *  a session (`upgrade.url` is where). Rides on `spend_limited`
+       *  because every shipped client already renders that shape; clients
+       *  that know the flag say so instead of "resets at midnight". */
+      verificationRequired?: true
+      /**
+       * WHICH verification the refusal asks for, for a client that labels its
+       * own button rather than rendering `message`. Two different gates set
+       * `verificationRequired`: the phone gate asks for an SMS code
+       * (docs/freebuff-phone-gate.md) and the identity gate asks for an ID
+       * and a selfie (docs/freebuff-id-verification.md). Absent on an older
+       * server, so a client must not assume either.
+       */
+      verificationKind?: 'phone' | 'identity'
     }
   | {
       /** Retired single-use Desktop claim; persist a new id before retrying. */
@@ -1150,6 +1159,22 @@ export type FreebuffSessionAdmissionResponse = (
       currentInstanceId: string
     }
 ) & {
+  /** Current resolved country for picker recommendations, independent of a
+   *  running session's historical limited-access reason. Display only. */
+  pickerCountryCode?: string | null
+  /** Current country verification; does not grant full access. Sent on GET. */
+  countryVerified?: boolean
+  /** Whether a country verification could change this account's access
+   *  right now. False for a limited-access region (verifying one grants
+   *  nothing) and for an account whose region is set; clients hide the
+   *  "verify country" prompt then. Absent from an older server: show it. */
+  verificationCanChangeAccess?: boolean
+  /** Why `verificationCanChangeAccess` is what it is. */
+  verificationReason?: FreebuffCountryVerificationReason
+  /** Present only when verifying cannot help (`limited_region` /
+   *  `region_locked`) and a paid plan above the account's own exists: the
+   *  "unlock more with a plan" offer, numbers from the server's catalog. */
+  countryUpsell?: FreebuffPlanUpsell
   /** Unexpired Desktop purchases, including occupied hours. Picker metadata;
    * admission still checks ownership, liveness, and capacity atomically. */
   desktopPurchases?: FreebuffDesktopPurchaseInfo[]
@@ -1157,6 +1182,52 @@ export type FreebuffSessionAdmissionResponse = (
   /** Multi-session Desktop responses only. Counts live, unexpired rows across
    * all Desktop processes for this user. */
   desktopSessionCounts?: FreebuffDesktopSessionCounts
+  /** Desktop responses only: the server lifts this account's tab cap through
+   *  Freebuff Projects' allowlist (COD-878), the only thing that lifts it. */
+  desktopTabCapExempt?: true
+}
+
+/**
+ * Why a country verification can or cannot change an account's access
+ * (docs/freebuff-access-floor.md § Declare first):
+ * - `limited_region`: the account is in (or declared) a limited-access
+ *   country; verifying it grants nothing.
+ * - `region_locked`: the account's region is set to limited access, and no
+ *   self-serve verification changes it (only a region review).
+ * - `eligible`: verifying from a direct connection in a full-access country
+ *   can change it.
+ */
+export type FreebuffCountryVerificationReason =
+  | 'limited_region'
+  | 'region_locked'
+  | 'eligible'
+
+/**
+ * A paid-plan offer for a limited-access account, built on the server from
+ * the plan catalog (`freebuffLimitedAccessUpsell`) so every surface renders
+ * the same figures. Daily Freebucks are at LIMITED access, which is what the
+ * account would actually get.
+ */
+export type FreebuffPlanUpsell = {
+  /** The plan the headline names: the best plan for an account without one,
+   *  the next plan up for a subscriber. */
+  planId: string
+  planName: string
+  /** Daily Freebucks on `planId` at limited access. */
+  dailyFreebucks: number
+  /** Daily Freebucks the account gets now (its plan, or the free pool). */
+  currentDailyFreebucks: number
+  /** Every plan above the account's own, cheapest first. */
+  plans: Array<{
+    planId: string
+    planName: string
+    dailyFreebucks: number
+    priceUsd: number
+  }>
+  /** e.g. "Get up to 70 hours a day with Pro". */
+  headline: string
+  /** The plans page, tagged `source=country_limited` for attribution. */
+  plansUrl: string
 }
 
 export type FreebuffSessionServerResponse =
@@ -1168,7 +1239,9 @@ export type FreebuffSessionServerResponse =
        *  doesn't match the stored one; the chat-completions gate also
        *  surfaces it as a 409 for fast in-flight feedback. */
       status: 'superseded'
+      pickerCountryCode?: string | null
       desktopSessionCounts?: FreebuffDesktopSessionCounts
+      desktopTabCapExempt?: true
       desktopPurchases?: FreebuffDesktopPurchaseInfo[]
       desktopRefunds?: FreebuffDesktopRefundInfo[]
     }
@@ -1233,8 +1306,7 @@ export const FREEBUFF_GATE_CODES = {
    * A withdrawn model is one every released binary still has in its
    * compiled-in catalog, so the client asks again on the next send no matter
    * what we answer. `endsTheSession: true` would make each of those a fresh
-   * admission — the loop that cost the limited tier 2.5x its admissions and put
-   * 91% of its sessions on the 0.1-unit floor (#1801). False, the client keeps
+   * admission — a re-admission loop (#1801). False, the client keeps
    * its window, shows the message, and the user picks another model.
    *
    * 410 rather than 409: the resource is gone rather than in conflict, and it

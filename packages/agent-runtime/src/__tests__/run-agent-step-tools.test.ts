@@ -24,7 +24,13 @@ import { clearAgentGeneratorCache } from '../run-programmatic-step'
 import {
   FOLLOWUP_SUGGESTION_LIMIT_TAG,
   MAX_FOLLOWUP_SUGGESTION_CALLS_PER_RESPONSE,
+  MAX_TOOL_CALLS_PER_RESPONSE,
+  TOOL_CALL_LIMIT_TAG,
 } from '../tools/stream-parser'
+import {
+  SUGGEST_PROMPTS_BEFORE_ANSWER_MESSAGE,
+  SUGGEST_PROMPTS_BEFORE_ANSWER_TAG,
+} from '../util/suggest-prompts-before-answer'
 import { createToolCallChunk } from './test-utils'
 
 import type { AgentTemplate } from '../templates/types'
@@ -304,53 +310,98 @@ describe('runAgentStep - set_output tool', () => {
     expect(result.agentState.output).toEqual({})
   })
 
-  it('ends the step after suggest_prompts without requiring a follow-up response', async () => {
-    const suggestAgent: AgentTemplate = {
+  describe('suggest_prompts and the answer', () => {
+    const suggestAgent = (): AgentTemplate => ({
       ...testAgent,
       toolNames: ['suggest_prompts', 'end_turn'],
-    }
+    })
     const fileContextWithSuggest: ProjectFileContext = {
       ...mockFileContext,
       customToolDefinitions: {
         suggest_prompts: {
           inputSchema: {
             type: 'object',
-            properties: {
-              response: { type: 'string' },
-              prompts: { type: 'array' },
-            },
-            required: ['response', 'prompts'],
+            properties: { prompts: { type: 'array' } },
+            required: ['prompts'],
           },
-          description: 'Finish with the answer and suggest next prompts',
+          description: 'Suggest follow-up prompts',
           // This legacy flag is intentionally false: loop termination comes
           // from TOOLS_WHICH_WONT_FORCE_NEXT_STEP, not the obsolete stop hint.
           endsAgentStep: false,
         },
       },
     }
-    const sessionState = getInitialSessionState(fileContextWithSuggest)
-    runAgentStepBaseParams.promptAiSdkStream = async function* () {
-      yield createToolCallChunk('suggest_prompts', {
-        response: 'Finished.',
-        prompts: [{ prompt: 'Add tests' }],
+
+    /** One step that writes `text`, then calls suggest_prompts. */
+    const step = (text: string, messageHistory: Message[] = []) => {
+      runAgentStepBaseParams.promptAiSdkStream = async function* () {
+        yield { type: 'text' as const, text }
+        yield createToolCallChunk('suggest_prompts', {
+          prompts: [{ prompt: 'Add tests' }],
+        })
+        return promptSuccess('mock-message-id')
+      }
+      runAgentStepBaseParams.requestToolCall = async () => ({
+        output: [{ type: 'json', value: { ok: true } }],
       })
-      return promptSuccess('mock-message-id')
+      const agent = suggestAgent()
+      return runAgentStep({
+        ...runAgentStepBaseParams,
+        agentType: agent.id,
+        localAgentTemplates: { [agent.id]: agent },
+        agentTemplate: agent,
+        agentState: {
+          ...getInitialSessionState(fileContextWithSuggest).mainAgentState,
+          messageHistory,
+        },
+        fileContext: fileContextWithSuggest,
+        prompt: 'Plan the helper',
+      })
     }
-    runAgentStepBaseParams.requestToolCall = async () => ({
-      output: [{ type: 'json', value: { ok: true } }],
+
+    const notes = (history: Message[]) =>
+      history.filter((m) => m.tags?.includes(SUGGEST_PROMPTS_BEFORE_ANSWER_TAG))
+
+    it('ends the turn on cards that follow a real answer, with no note', async () => {
+      const answer = `Here is the plan.\n\n${'1. A concrete step and why it is needed.\n'.repeat(10)}`
+      const result = await step(answer)
+      expect(result.shouldEndTurn).toBe(true)
+      expect(notes(result.agentState.messageHistory)).toHaveLength(0)
     })
 
-    const result = await runAgentStep({
-      ...runAgentStepBaseParams,
-      agentType: suggestAgent.id,
-      localAgentTemplates: { [suggestAgent.id]: suggestAgent },
-      agentTemplate: suggestAgent,
-      agentState: sessionState.mainAgentState,
-      fileContext: fileContextWithSuggest,
-      prompt: 'Finish the task',
+    it('continues a turn whose cards arrive before the answer, with the note', async () => {
+      const result = await step(
+        "Planning-only, no code changed — here's the proposal.",
+      )
+      expect(result.shouldEndTurn).toBe(false)
+      const [note] = notes(result.agentState.messageHistory)
+      expect(note?.role).toBe('user')
+      expect(JSON.stringify(note?.content)).toContain(
+        JSON.stringify(SUGGEST_PROMPTS_BEFORE_ANSWER_MESSAGE).slice(1, -1),
+      )
+      // After the step's own tool result, so it is the last thing read.
+      expect(result.agentState.messageHistory.at(-1)).toBe(note)
     })
 
-    expect(result.shouldEndTurn).toBe(true)
+    it('continues only once per prompt', async () => {
+      const result = await step("Here's the proposal.", [
+        userMessage({ content: 'Plan it', tags: ['USER_PROMPT'] }),
+        assistantMessage({
+          type: 'tool-call',
+          toolCallId: 'earlier',
+          toolName: 'suggest_prompts',
+          input: { prompts: [] },
+        }),
+        {
+          role: 'tool',
+          toolCallId: 'earlier',
+          toolName: 'suggest_prompts',
+          content: [],
+        },
+      ])
+      expect(result.shouldEndTurn).toBe(true)
+      expect(notes(result.agentState.messageHistory)).toHaveLength(0)
+    })
   })
 
   describe('follow-up suggestion cap', () => {
@@ -452,6 +503,71 @@ describe('runAgentStep - set_output tool', () => {
       expect(toolCalls).toHaveLength(MAX_FOLLOWUP_SUGGESTION_CALLS_PER_RESPONSE)
       // Suggestions never force another step, so the cut response ends the turn.
       expect(result.shouldEndTurn).toBe(true)
+    })
+  })
+
+  describe('tool-call cap', () => {
+    // 10-22: MiMo responses streamed thousands of calls (3,539 to 12,146),
+    // which compaction could then never fit, wedging the chat.
+    const checkAgent = (): AgentTemplate => ({
+      ...testAgent,
+      id: 'tool-cap-agent',
+      toolNames: ['run_check', 'end_turn'],
+    })
+    const fileContextWithCheck = (): ProjectFileContext => ({
+      ...mockFileContext,
+      customToolDefinitions: {
+        run_check: {
+          inputSchema: {
+            type: 'object',
+            properties: { n: { type: 'number' } },
+            required: ['n'],
+          },
+          description: 'Run a check',
+          endsAgentStep: false,
+        },
+      },
+    })
+
+    it('stops a response past the cap, runs the first calls, and tells the model', async () => {
+      const seen = { pulled: 0, finished: false, signal: undefined as AbortSignal | undefined }
+      runAgentStepBaseParams.promptAiSdkStream = (async function* (params: { signal: AbortSignal }) {
+        seen.signal = params.signal
+        for (let i = 0; i < 2_000; i++) {
+          seen.pulled++
+          yield createToolCallChunk('run_check', { n: i })
+        }
+        seen.finished = true
+        return promptSuccess('mock-message-id')
+      }) as any
+      const executed: string[] = []
+      runAgentStepBaseParams.requestToolCall = async ({ toolName }) => {
+        executed.push(toolName)
+        return { output: [{ type: 'json', value: { ok: true } }] }
+      }
+      const runSignal = new AbortController().signal
+      const agent = checkAgent()
+      const fileContext = fileContextWithCheck()
+      const result = await runAgentStep({
+        ...runAgentStepBaseParams,
+        signal: runSignal,
+        agentType: agent.id,
+        localAgentTemplates: { [agent.id]: agent },
+        agentTemplate: agent,
+        agentState: getInitialSessionState(fileContext).mainAgentState,
+        fileContext,
+        prompt: 'Check everything',
+      })
+
+      expect(executed).toHaveLength(MAX_TOOL_CALLS_PER_RESPONSE)
+      expect(seen.pulled).toBe(MAX_TOOL_CALLS_PER_RESPONSE + 1)
+      expect(seen.finished).toBe(false)
+      expect(seen.signal?.aborted).toBe(true)
+      expect(runSignal.aborted).toBe(false)
+      const notes = result.agentState.messageHistory.filter((m) =>
+        m.tags?.includes(TOOL_CALL_LIMIT_TAG),
+      )
+      expect(notes).toHaveLength(1)
     })
   })
 

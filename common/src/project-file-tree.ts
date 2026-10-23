@@ -90,6 +90,11 @@ export async function getProjectFileTree(params: {
   projectRoot: string
   maxFiles?: number
   fs: CodebuffFileSystem
+  /**
+   * Gitignore-style patterns skipped during the walk, on top of the defaults,
+   * so what they hide is never counted against `maxFiles`.
+   */
+  extraIgnore?: readonly string[]
 }): Promise<FileTreeNode[]> {
   const withDefaults = { maxFiles: DEFAULT_MAX_FILES, ...params }
   const { projectRoot, fs } = withDefaults
@@ -99,6 +104,7 @@ export async function getProjectFileTree(params: {
 
   const _start = Date.now()
   const defaultIgnore = createDefaultIgnore()
+  for (const pattern of params.extraIgnore ?? []) defaultIgnore.add(pattern)
 
   if (isShallowScanRoot(projectRoot)) {
     defaultIgnore.add('.*')
@@ -199,8 +205,9 @@ async function parseGitignoreWithMode(params: {
   fullDirPath: string
   fs: CodebuffFileSystem
   throwOnReadError: boolean
+  explicitRead?: boolean
 }): Promise<ignore.Ignore> {
-  const { fullDirPath, fs, throwOnReadError } = params
+  const { fullDirPath, fs, throwOnReadError, explicitRead = false } = params
 
   const ig = ignore.default()
   const directoryEntries = throwOnReadError
@@ -208,6 +215,7 @@ async function parseGitignoreWithMode(params: {
     : undefined
 
   for (const fileName of PROJECT_IGNORE_FILES) {
+    if (explicitRead && fileName === '.gitignore') continue
     const ignoreFilePath = path.join(fullDirPath, fileName)
     if (directoryEntries) {
       if (!directoryEntries.has(fileName)) continue
@@ -302,12 +310,15 @@ export async function isFileIgnored(params: {
   fs: CodebuffFileSystem
   /** Allow the env template past built-in rules while strictly applying project rules. */
   allowEnvTemplate?: boolean
+  /** Explicit reads skip Git/discovery exclusions, but keep agent-owned ignore rules. */
+  explicitRead?: boolean
 }): Promise<boolean> {
   const {
     filePath,
     projectRoot,
     fs,
     allowEnvTemplate: allowEnvTemplateRequested = false,
+    explicitRead = false,
   } = params
   const allowEnvTemplate =
     allowEnvTemplateRequested && isEnvTemplateFilePath(filePath)
@@ -316,7 +327,10 @@ export async function isFileIgnored(params: {
   const fullFilePath = path.resolve(resolvedProjectRoot, filePath)
   if (!isPathInside(resolvedProjectRoot, fullFilePath)) return false
 
-  const defaultIgnore = createDefaultIgnore(allowEnvTemplate)
+  const defaultIgnore =
+    explicitRead && !allowEnvTemplate
+      ? ignore.default()
+      : createDefaultIgnore(allowEnvTemplate)
 
   const relativeFilePath = toPosixPath(
     path.relative(resolvedProjectRoot, fullFilePath),
@@ -332,6 +346,7 @@ export async function isFileIgnored(params: {
         fullDirPath: currentDir,
         fs,
         throwOnReadError: allowEnvTemplate,
+        explicitRead: explicitRead && !allowEnvTemplate,
       })
     } catch (error) {
       if (allowEnvTemplate) return true

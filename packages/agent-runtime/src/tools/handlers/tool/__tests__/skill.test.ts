@@ -60,6 +60,24 @@ describe('handleSkill', () => {
     expect(value.name).toBe('demo')
     expect(value.description).toBe('installed at runtime')
     expect(value.content).toContain('body for installed at runtime')
+    expect(value.content).toContain(
+      JSON.stringify(`${projectRoot.replace(/\\/g, '/')}/.claude/skills/demo/`),
+    )
+    expect(value.content).toContain("not the project's working directory")
+  })
+
+  it('never evaluates a JavaScript frontmatter block found on disk', async () => {
+    const skillDir = path.join(projectRoot, '.agents', 'skills', 'demo')
+    fs.mkdirSync(skillDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      "---js\nglobalThis.__skillHandlerEval = true; ({ name: 'demo', description: 'x' })\n---\n# demo\n",
+    )
+
+    const { output } = await callSkill('demo', { projectRoot, skills: {} })
+
+    expect((globalThis as Record<string, unknown>).__skillHandlerEval).toBeUndefined()
+    expect((output as any)[0].value.content).toContain("Skill 'demo' not found")
   })
 
   it('prefers the on-disk copy over a stale pre-loaded cache', async () => {
@@ -80,6 +98,10 @@ describe('handleSkill', () => {
 
     expect(value.description).toBe('fresh on disk')
     expect(value.content).toContain('body for fresh on disk')
+    expect(value.content).toContain(
+      JSON.stringify(`${projectRoot.replace(/\\/g, '/')}/.claude/skills/demo/`),
+    )
+    expect(value.content).not.toContain('/nonexistent/')
   })
 
   it('honors user-only policy from the highest-precedence project skill', async () => {
@@ -113,7 +135,10 @@ describe('handleSkill', () => {
     const value = (output as any)[0].value
 
     expect(value.description).toBe('cache only')
-    expect(value.content).toBe('cached body')
+    expect(value.content).toContain(
+      'Base directory for this skill: "/nonexistent/"',
+    )
+    expect(value.content).toEndWith('cached body')
   })
 
   it('returns a not-found error when the skill is missing everywhere', async () => {
@@ -191,6 +216,9 @@ describe('handleSkill home-directory opt-in', () => {
     const value = (output as any)[0].value
 
     expect(value.name).toBe('deploy')
+    expect(value.content).toContain(
+      JSON.stringify(`${fakeHome.replace(/\\/g, '/')}/.claude/skills/deploy/`),
+    )
   })
 
   it('never lets a host-home skill shadow the repo, even when opted in', async () => {

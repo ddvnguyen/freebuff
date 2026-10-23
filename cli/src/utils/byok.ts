@@ -1,5 +1,8 @@
 import {
+  ByokCredentialError,
   createBunByokConnectionStore,
+  withByokReasoningEffort,
+  withEffectiveByokLimits,
 } from '@codebuff/sdk'
 import { create } from 'zustand'
 
@@ -49,16 +52,6 @@ export function closeByokSetup(): void {
 
 export function isByokSetupOpen(): boolean {
   return useByokSelectionStore.getState().setupOpen
-}
-
-/**
- * True when the chat may be shown without a Freebuff session: a connection is
- * selected, or the user is setting one up.
- */
-export function useBypassesFreebuffSession(): boolean {
-  return useByokSelectionStore(
-    (state) => state.selected !== undefined || state.setupOpen,
-  )
 }
 
 /**
@@ -113,17 +106,38 @@ export function saveSelectedByokConnection(
   )
 }
 
-/** Resolve only at run start so the secret never reaches chat state or logs. */
+/** Resolve only at run start so the secret never reaches chat state or logs.
+ *  Untouched default limits become the provider-reported window (see
+ *  withEffectiveByokLimits), so a run does not compact every few tool calls.
+ *  The `/byok effort` pick rides along; none sends no reasoning field. */
 export async function resolveByokConnection(
   selected: SelectedByokConnection,
 ): Promise<ResolvedByokConnection> {
-  return getCliByokStore().resolve(selected)
+  return withByokReasoningEffort(
+    await withEffectiveByokLimits(await getCliByokStore().resolve(selected)),
+    loadSettings().byokReasoningEffort,
+  )
+}
+
+/**
+ * What a run start shows when the selected connection cannot be loaded. A
+ * credential failure says exactly what is wrong (e.g. which environment
+ * variable is unset in this process); its text is the store's own and never
+ * carries a key. Anything else keeps the generic line.
+ */
+export function byokLoadFailureMessage(error: unknown): string {
+  return error instanceof ByokCredentialError ||
+    (error instanceof Error && error.name === 'ByokCredentialError')
+    ? `⚠️ Unable to load the selected BYOK connection: ${error.message}`
+    : '⚠️ Unable to load the selected BYOK connection. Check its credential and select it again.'
 }
 
 export function describeByokConnection(connection: Pick<ByokConnection, 'name' | 'provider' | 'model'>): string {
   const provider = connection.provider === 'openrouter'
     ? 'OpenRouter'
-    : 'OpenAI-compatible'
+    : connection.provider === 'chatgpt'
+      ? 'ChatGPT plan'
+      : 'OpenAI-compatible'
   return `${connection.name} (${provider} · ${connection.model})`
 }
 

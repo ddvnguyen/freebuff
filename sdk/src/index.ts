@@ -54,6 +54,9 @@ export {
 } from './agent-publisher-trust'
 export * from './credentials'
 export * from './byok'
+export * from './chatgpt'
+export * from './project-understanding'
+export { resolveProjectKey } from './project-profile'
 export {
   getDefaultAgentDirs,
   listLocalAgentFiles,
@@ -87,9 +90,11 @@ export type { ValidationResult, ValidateAgentsOptions } from './validate-agents'
 // Free-mode capacity deferral notifications (server-side tier shedding)
 export {
   setFreeModeCapacityDeferralListener,
-  setFreeModeSessionSlowedListener,
 } from './impl/model-provider'
-export type { FreeModeCapacityDeferral } from './impl/model-provider'
+export type {
+  CodebuffRequestHeadersProvider,
+  FreeModeCapacityDeferral,
+} from './impl/model-provider'
 
 // Error utilities
 export {
@@ -135,6 +140,7 @@ export type { FileTokenData, TokenCallerMap } from '@codebuff/code-map'
 
 export {
   getActiveTerminalCommandProcesses,
+  releaseBackgroundTerminalCommands,
   runTerminalCommand,
 } from './tools/run-terminal-command'
 export type {

@@ -14,7 +14,7 @@ import { release } from 'node:os'
 import { join } from 'path'
 
 import { sponsoredContainment } from '../../../sdk/src/tools/sponsored-sandbox'
-import { bunGitRunner, type GitRunner } from './sponsored-worktree'
+import { bunGitRunner, type GitRunner } from './sponsored-git'
 
 export type SponsoredCliCapabilityResult = {
   sponsoredCapability: SponsoredCapability | null
@@ -134,6 +134,7 @@ function execution(
           ? 'cli_wsl'
           : 'cli_linux',
     status: 'available',
+    ...(platform === 'linux' ? { outboundNetwork: true } : {}),
   }
 }
 

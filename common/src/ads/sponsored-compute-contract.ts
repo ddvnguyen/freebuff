@@ -1,4 +1,5 @@
 import { FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID } from '../constants/freebuff-model-ids'
+import { SPONSORED_RUN_TOKEN_TTL_MS } from './sponsored-run-token'
 
 import type {
   SponsoredExecutionSurface,
@@ -8,14 +9,25 @@ import type {
   SPONSORED_WINDOWS_EXECUTION_SURFACE,
   SponsoredExecutionContainment,
 } from './sponsored-windows'
+import type { SPONSORED_IN_PLACE_VERSION } from './sponsored-in-place'
+import type { SPONSORED_RUN_SPEC_VERSION } from './sponsored-run-spec'
+
+/** The clients a funded Accept can come from. */
+export const SPONSORED_ACCEPT_SURFACES = ['desktop', 'cli', 'web'] as const
+
+export type SponsoredAcceptSurface = (typeof SPONSORED_ACCEPT_SURFACES)[number]
 
 /**
  * The funded Accept request, `POST /api/v1/ads/proposal/{id}/accept`, as the
  * accepting surface sends it and the route reads it.
  */
 export type SponsoredAcceptRequest = {
-  /** Which kind of client accepts: `desktop` or `cli`. */
-  surface: 'desktop' | 'cli'
+  /**
+   * Which kind of client accepts: `desktop` or `cli` over the bearer route,
+   * `web` (the browser workspace) from the browser workspace's server.
+   */
+  surface: SponsoredAcceptSurface
+  nativeDesktopTools?: boolean
   /** The run id the surface minted before consent. */
   runId: string
   /** The hash of the exact procedure the user consented to. */
@@ -31,6 +43,24 @@ export type SponsoredAcceptRequest = {
    * because an older client does not send it.
    */
   clientExecutionSurface?: SponsoredExecutionSurface
+  /**
+   * `1`: this client runs the accepted work IN PLACE, in the accepting
+   * conversation, and its terminal state is `delivered`
+   * (`./sponsored-in-place.ts`). Sent again here rather than inferred from
+   * the offer, because an offer can outlive the build that was shown it: the
+   * server records it on the row at Accept and binds the run's deliverable to
+   * it from then on.
+   */
+  inPlaceExecutionVersion?: typeof SPONSORED_IN_PLACE_VERSION
+  /**
+   * `1`: this client runs the run spec (`./sponsored-run-spec.ts`). The 200
+   * then carries `runSpec`, built from the server's own skill, on a fresh
+   * Accept and on every replay of it. A procedure that names a skill the
+   * server cannot resolve is refused `409 run_spec_unavailable` before
+   * anything is charged (`503 run_spec_unavailable` on a replay, which
+   * charges nothing again and is safe to retry).
+   */
+  runSpecVersion?: typeof SPONSORED_RUN_SPEC_VERSION
 }
 
 /**
@@ -82,6 +112,90 @@ export function acceptClientSurfacePairsWithRow(
   return sponsoredAcceptSurfaceMatchesRow(clientSurface, rowSurface)
 }
 
+/**
+ * How long a grant keeps spending once its run has STARTED (COD-665).
+ *
+ * The window opens at the run's first reserved call on the server, and at the
+ * turn taking the grant on Desktop -- never at Accept. An in-place run is a
+ * turn queued BEHIND whatever the user already had running, and a clock that
+ * started at Accept spent the wait: some grants expired before their turn
+ * came up, and others were cut off mid-run. Accept is still the one charge;
+ * only the compute window moved.
+ */
+export const SPONSORED_COMPUTE_RUN_WINDOW_MS = 60 * 60_000
+
+/**
+ * How long an accepted grant may wait for its run to start: the hard end of
+ * every grant, measured from Accept, so one whose turn never comes still dies.
+ *
+ * The run token's lifetime, on purpose. A run that starts later than this
+ * could not report its own verdict, so a grant that outlived the token would
+ * fund work nobody can close out.
+ */
+export const SPONSORED_COMPUTE_START_DEADLINE_MS = SPONSORED_RUN_TOKEN_TTL_MS
+
+/**
+ * The deadline a grant has once its run starts at `startedAtMs`: the run
+ * window from then, never past the grant's own expiry.
+ *
+ * A minimum, so it is safe to apply on EVERY call and not only the first: a
+ * later start can never push the deadline out, and the first one fixes it.
+ * The same rule on both sides, which is what keeps Desktop's local cutoff at
+ * or before the server's -- Desktop applies it when the turn takes the grant,
+ * a moment before that turn's first call reaches the server. A grant issued
+ * before COD-665 already expires an hour after Accept, and this leaves it so.
+ */
+export function sponsoredComputeRunDeadlineMs(
+  grantExpiresAtMs: number,
+  startedAtMs: number,
+): number {
+  return Math.min(
+    grantExpiresAtMs,
+    startedAtMs + SPONSORED_COMPUTE_RUN_WINDOW_MS,
+  )
+}
+
+/**
+ * How long past a running off-Cloud run's spend window the server waits
+ * before its stale sweep fails the row (`running_window` in
+ * `sponsoredExecution.ts`). A turn's last calls can land a little after its
+ * grant closes, and the client's terminal report after that; half an hour
+ * covers both without leaving a dead run on the card for a day.
+ */
+export const SPONSORED_RUNNING_SWEEP_GRACE_MS = 30 * 60_000
+
+/**
+ * How long a Freebuff Web Accept may wait for its run to START before the
+ * stale sweep fails it (`web_start` in `sponsoredExecution.ts`), and before
+ * the web worker refuses to start it.
+ *
+ * Web runs on OUR worker, which reports `running` before the turn's first
+ * call, so the 24-hour run-token clock the off-Cloud rows wait on would only
+ * leave a spinner on the card when the queued run was lost. The run waits
+ * behind at most the chat's current turn; two hours covers a long one. The
+ * worker applies the same deadline, so a run the sweep could fail is never
+ * started.
+ */
+export const SPONSORED_WEB_START_WINDOW_MS = 2 * 60 * 60_000
+
+/**
+ * When the stale sweep may fail an off-Cloud row that reported `running` at
+ * `runningAtMs`: the spend window from then plus the grace, never past the
+ * run token's own expiry (measured from Accept), because a report after that
+ * could not be authenticated anyway.
+ */
+export function sponsoredRunningSweepDeadlineMs(
+  runningAtMs: number,
+  acceptedAtMs: number,
+): number {
+  return Math.min(
+    runningAtMs +
+      SPONSORED_COMPUTE_RUN_WINDOW_MS +
+      SPONSORED_RUNNING_SWEEP_GRACE_MS,
+    acceptedAtMs + SPONSORED_RUN_TOKEN_TTL_MS,
+  )
+}
+
 /** Public response shape. The bearer belongs in host memory, never a thread. */
 export type SponsoredComputeGrant = Readonly<{
   token: string
@@ -89,6 +203,13 @@ export type SponsoredComputeGrant = Readonly<{
   runId: string
   procedureSha256: string
   modelId: string
+  /**
+   * When the grant stops spending. Issued as Accept +
+   * {@link SPONSORED_COMPUTE_START_DEADLINE_MS}, and brought in to the run's
+   * start + {@link SPONSORED_COMPUTE_RUN_WINDOW_MS} once it starts (see
+   * {@link sponsoredComputeRunDeadlineMs}). A replayed Accept after the start
+   * answers the brought-in value.
+   */
   expiresAtMs: number
   allowanceUsdMicros: number
   /**
@@ -116,6 +237,10 @@ export type SponsoredComputePolicy = Readonly<{
   campaigns: SponsoredComputeCampaigns
   allowanceUsdMicros: number
   acceptancePriceCents: number
+  /**
+   * The grant's life once its run has started
+   * ({@link SPONSORED_COMPUTE_RUN_WINDOW_MS}); not measured from Accept.
+   */
   ttlMs: number
 }>
 
@@ -195,9 +320,9 @@ export function readSponsoredComputePolicy(
     modelId,
     campaigns,
     // The configured acceptance fee is the only commercial charge. Compute is an
-    // internal, bounded cost of fulfilling that offer, capped here at $0.50.
-    allowanceUsdMicros: 500_000,
+    // internal, bounded cost of fulfilling that offer, capped here.
+    allowanceUsdMicros: 2_500_000,
     acceptancePriceCents,
-    ttlMs: 60 * 60_000,
+    ttlMs: SPONSORED_COMPUTE_RUN_WINDOW_MS,
   })
 }

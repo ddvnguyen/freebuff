@@ -87,14 +87,15 @@ describe('freebuff model preference', () => {
     getConfigDirSpy = spyOn(auth, 'getConfigDir').mockReturnValue(testConfigDir)
 
     // Written directly, with no migration marker, exactly like a real
-    // pre-upgrade settings file. GLM was the default until 2026-09-02, so this
-    // first load is the one-time move onto the current default; from here on
-    // the file is stamped and every pick below is the user's.
+    // pre-upgrade settings file. GLM 5.3 Flash was the default from 2026-09-05
+    // until MiMo 2.6 Flash took over on 2026-09-30, and that flip migrated
+    // nothing: this first load stamps the file and keeps the GLM pick as it
+    // is. From here on every pick below is the user's.
     fs.writeFileSync(
       path.join(testConfigDir, 'settings.json'),
       JSON.stringify({ freebuffModel: FREEBUFF_GLM_V53_FLASH_MODEL_ID }),
     )
-    expect(loadFreebuffModelPreference()).toBe(DEFAULT_FREEBUFF_MODEL_ID)
+    expect(loadFreebuffModelPreference()).toBe(FREEBUFF_GLM_V53_FLASH_MODEL_ID)
 
     // And a round-trip through save/load leaves every selectable row alone. The
     // property is "the picker is the user's decision, not ours" — asserted
@@ -189,5 +190,19 @@ describe('the one-time Freebucks introduction mark', () => {
       fs.readFileSync(path.join(testConfigDir, 'settings.json'), 'utf8'),
     ) as { freebucksIntroSeenAt?: string }
     expect(typeof raw.freebucksIntroSeenAt).toBe('string')
+  })
+})
+
+describe('display-ad opt-in', () => {
+  test('keeps a string or string-list displayAds and drops anything else', () => {
+    testConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codebuff-settings-'))
+    getConfigDirSpy = spyOn(auth, 'getConfigDir').mockReturnValue(testConfigDir)
+
+    fs.writeFileSync(getSettingsPath(), JSON.stringify({ displayAds: ['cliSplash'] }))
+    expect(loadSettings().displayAds).toEqual(['cliSplash'])
+    fs.writeFileSync(getSettingsPath(), JSON.stringify({ displayAds: 'all' }))
+    expect(loadSettings().displayAds).toBe('all')
+    fs.writeFileSync(getSettingsPath(), JSON.stringify({ displayAds: [1] }))
+    expect(loadSettings().displayAds).toBeUndefined()
   })
 })

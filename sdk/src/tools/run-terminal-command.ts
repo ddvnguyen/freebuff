@@ -1,4 +1,6 @@
 import { spawn, spawnSync } from 'child_process'
+import { closeSync, mkdtempSync, openSync, statSync, writeFileSync } from 'fs'
+import { Readable as NodeReadable } from 'stream'
 import * as os from 'os'
 import * as path from 'path'
 
@@ -10,10 +12,7 @@ import type { Readable } from 'stream'
 
 import { stripColors } from '../../../common/src/util/string'
 import { getSystemProcessEnv } from '../env'
-import {
-  createWindowsBashNotFoundError,
-  findWindowsBash,
-} from './windows-bash'
+import { createWindowsBashNotFoundError, findWindowsBash } from './windows-bash'
 
 import type { CodebuffToolOutput } from '../../../common/src/tools/list'
 
@@ -254,6 +253,43 @@ export function rewriteWindowsNulRedirects(command: string): string {
   return command.replace(/([<>]\s*)nul(?![\w.])/gi, '$1/dev/null')
 }
 
+/**
+ * The error to report for a spawn that failed because `directory` is missing
+ * or not a directory, or null for any other failure.
+ *
+ * Such a spawn fails with an ENOENT that names the executable (`uv_spawn
+ * 'C:\Program Files\Git\bin\bash.exe'`, `posix_spawn 'bash'`, ripgrep's path).
+ * That reads as the program being missing, and models retried the same call
+ * hundreds of times instead of fixing the directory. Checked only after a
+ * failure, so a broker's own refusals (a sponsored run's containment) pass
+ * through unchanged.
+ */
+export function missingDirectoryError(
+  error: unknown,
+  directory: string,
+  label: string,
+): string | null {
+  const code = (error as NodeJS.ErrnoException | null)?.code
+  const message = error instanceof Error ? error.message : String(error)
+  if (
+    code !== 'ENOENT' &&
+    code !== 'ENOTDIR' &&
+    !/\b(ENOENT|ENOTDIR)\b/.test(message)
+  ) {
+    return null
+  }
+  try {
+    return statSync(directory).isDirectory()
+      ? null
+      : `${label} "${directory}" is not a directory.`
+  } catch (statError) {
+    const statCode = (statError as NodeJS.ErrnoException).code
+    return statCode === 'ENOENT' || statCode === 'ENOTDIR'
+      ? `${label} "${directory}" does not exist.`
+      : null
+  }
+}
+
 function spawnDirectTerminalCommand(
   request: TerminalCommandSpawnRequest,
 ): TerminalCommandProcess {
@@ -331,10 +367,6 @@ export function runTerminalCommand({
   signal?: AbortSignal
   terminalCommandBroker?: TerminalCommandBroker
 }): Promise<CodebuffToolOutput<'run_terminal_command'>> {
-  if (process_type === 'BACKGROUND') {
-    throw new Error('BACKGROUND process_type not implemented')
-  }
-
   return new Promise((resolve, reject) => {
     const isWindows = os.platform() === 'win32'
     const processEnv = {
@@ -343,7 +375,10 @@ export function runTerminalCommand({
     } as NodeJS.ProcessEnv
     for (const key of scrubEnvironmentKeys ?? []) delete processEnv[key]
     for (const [key, value] of Object.entries(processEnv)) {
-      if (value !== undefined && scrubEnvironmentValues?.some((secret) => value.trim() === secret.trim())) {
+      if (
+        value !== undefined &&
+        scrubEnvironmentValues?.some((secret) => value.trim() === secret.trim())
+      ) {
         delete processEnv[key]
       }
     }
@@ -398,6 +433,13 @@ export function runTerminalCommand({
 
     // Resolve cwd to absolute path
     const resolvedCwd = path.resolve(cwd)
+    const missingCwd = (error: unknown) =>
+      missingDirectoryError(error, resolvedCwd, 'Working directory')
+    const spawnFailure = (error: unknown, prefix: string) =>
+      new Error(
+        missingCwd(error) ??
+          `${prefix}: ${error instanceof Error ? error.message : String(error)}`,
+      )
 
     let childProcess: TerminalCommandProcess
     try {
@@ -415,13 +457,28 @@ export function runTerminalCommand({
             cwd: resolvedCwd,
             env: processEnv,
           }
+      if (process_type === 'BACKGROUND') {
+        startBackgroundCommand(
+          request,
+          command,
+          signal,
+          terminalCommandBroker,
+        ).then(resolve, (error) => {
+          const missing = missingCwd(error)
+          reject(missing ? new Error(missing) : error)
+        })
+        return
+      }
       childProcess = terminalCommandBroker
         ? terminalCommandBroker.start(request)
         : spawnDirectTerminalCommand(request)
     } catch (error) {
       reject(
-        new Error(
-          `${terminalCommandBroker ? 'Failed to start terminal command broker' : 'Failed to spawn command'}: ${error instanceof Error ? error.message : String(error)}`,
+        spawnFailure(
+          error,
+          terminalCommandBroker
+            ? 'Failed to start terminal command broker'
+            : 'Failed to spawn command',
         ),
       )
       return
@@ -576,10 +633,165 @@ export function runTerminalCommand({
         if (wasFinished) return
 
         reject(
-          new Error(
-            `${terminalCommandBroker ? 'Terminal command broker failed' : childProcess.pid ? 'Terminal command process failed' : 'Failed to spawn command'}: ${error instanceof Error ? error.message : String(error)}`,
+          spawnFailure(
+            error,
+            terminalCommandBroker
+              ? 'Terminal command broker failed'
+              : childProcess.pid
+                ? 'Terminal command process failed'
+                : 'Failed to spawn command',
           ),
         )
       })
   })
+}
+
+const backgroundCommands = new Map<
+  TerminalCommandProcess,
+  {
+    signal?: AbortSignal
+    onAbort: () => void
+    transferable: boolean
+  }
+>()
+
+/** Transfer direct background processes to an isolated environment's owner.
+ * Use only after a successful run when that owner guarantees later teardown.
+ * Broker-owned processes cannot outlive their broker. Other runs are untouched.
+ */
+export function releaseBackgroundTerminalCommands(signal: AbortSignal): void {
+  for (const [child, entry] of backgroundCommands) {
+    if (entry.signal !== signal || !entry.transferable) continue
+    signal.removeEventListener('abort', entry.onAbort)
+    liveChildren.delete(child)
+    backgroundCommands.delete(child)
+  }
+}
+
+async function startBackgroundCommand(
+  request: TerminalCommandSpawnRequest,
+  command: string,
+  signal?: AbortSignal,
+  broker?: TerminalCommandBroker,
+): Promise<CodebuffToolOutput<'run_terminal_command'>> {
+  const logDirectory = mkdtempSync(path.join(os.tmpdir(), 'codebuff-process-'))
+  const stdoutPath = path.join(logDirectory, 'stdout.log')
+  const stderrPath = path.join(logDirectory, 'stderr.log')
+  let child: TerminalCommandProcess
+  if (broker) {
+    // Keep the host's execution boundary, including sponsored-run guards.
+    writeFileSync(stdoutPath, '', { mode: 0o600 })
+    writeFileSync(stderrPath, '', { mode: 0o600 })
+    child = broker.start(request)
+    for (const [stream, file] of [
+      [child.stdout, stdoutPath],
+      [child.stderr, stderrPath],
+    ] as const) {
+      const output = new BoundedOutputBuffer(COMMAND_OUTPUT_LIMIT)
+      stream.on('data', (data: Buffer) => {
+        output.append(data.toString())
+        try {
+          writeFileSync(file, output.format())
+        } catch {
+          /* disk unavailable */
+        }
+      })
+    }
+  } else {
+    // Real files rather than pipes allow a sandbox owner to retain the service
+    // after the SDK exits. Logs are private and remain available for inspection.
+    const out = openSync(stdoutPath, 'w', 0o600)
+    let err: number | undefined
+    let process: ChildProcess
+    try {
+      err = openSync(stderrPath, 'w', 0o600)
+      process = spawn(request.executable, request.args, {
+        cwd: request.cwd,
+        env: request.env,
+        stdio: ['ignore', out, err],
+        detached: true,
+        windowsHide: true,
+      })
+    } finally {
+      closeSync(out)
+      if (err !== undefined) closeSync(err)
+    }
+    const completion = new Promise<number | null>((resolve, reject) => {
+      process.once('error', reject)
+      process.once('close', resolve)
+    })
+    // Install the rejection handler before awaiting spawn success.
+    completion.catch(() => {})
+    await new Promise<void>((resolve, reject) => {
+      process.once('spawn', resolve)
+      process.once('error', reject)
+    })
+    process.unref()
+    child = {
+      pid: process.pid,
+      stdout: NodeReadable.from([]),
+      stderr: NodeReadable.from([]),
+      completion,
+      kill: (signal) => killProcessGroup(process, signal),
+      isAlive: () => isProcessGroupAlive(process),
+    }
+  }
+  if (!child.pid) {
+    child.completion.catch(() => {})
+    child.kill('SIGKILL')
+    throw new Error('Background command started without a process ID')
+  }
+  const onAbort = () => {
+    try {
+      child.kill('SIGKILL')
+    } catch {
+      /* already exited */
+    }
+    liveChildren.delete(child)
+    backgroundCommands.delete(child)
+  }
+  liveChildren.add(child)
+  installExitSweep()
+  backgroundCommands.set(child, { signal, onAbort, transferable: !broker })
+  signal?.addEventListener('abort', onAbort, { once: true })
+  if (signal?.aborted) onAbort()
+  const finish = (exitCode: number | null, error?: unknown) => {
+    try {
+      writeFileSync(
+        path.join(logDirectory, 'exit.json'),
+        JSON.stringify({
+          exitCode,
+          ...(error ? { error: String(error) } : {}),
+        }),
+        { mode: 0o600 },
+      )
+    } catch {
+      /* diagnostic only */
+    }
+    // A shell can exit before descendants. Keep ownership until abort/exit.
+    if (!child.isAlive()) {
+      signal?.removeEventListener('abort', onAbort)
+      liveChildren.delete(child)
+      backgroundCommands.delete(child)
+    }
+  }
+  child.completion.then(
+    (code) => finish(code),
+    (error) => finish(null, error),
+  )
+  return [
+    {
+      type: 'json',
+      value: {
+        command,
+        processId: child.pid!,
+        backgroundProcessStatus: signal?.aborted ? 'error' : 'running',
+        stdoutPath,
+        stderrPath,
+        message: signal?.aborted
+          ? 'Background command cancelled: the run was aborted.'
+          : `Started background command. Check readiness and logs at ${stdoutPath} and ${stderrPath}; starting is not proof of success. Use subsequent terminal calls to inspect or stop PID ${child.pid}.`,
+      },
+    },
+  ]
 }

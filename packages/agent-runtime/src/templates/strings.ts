@@ -1,16 +1,19 @@
-import { KNOWLEDGE_FILE_NAMES_LOWERCASE } from '@codebuff/common/constants/knowledge'
+import {
+  KNOWLEDGE_FILE_NAMES_LOWERCASE,
+  PROJECT_INSTRUCTIONS_HEADER,
+} from '@codebuff/common/constants/knowledge'
 import { escapeString } from '@codebuff/common/util/string'
 import { z } from 'zod/v4'
 
 import { getAgentTemplate } from './agent-registry'
-import { buildFullSpawnableAgentsSpec } from './prompts'
+import { buildFullSpawnableAgentsSpec, modelSpawnableAgents } from './prompts'
 import { PLACEHOLDER, placeholderValues } from './types'
 import {
   getGitChangesPrompt,
   getProjectFileTreePrompt,
   getSystemInfoPrompt,
 } from '../system-prompt/prompts'
-import { parseUserMessage } from '../util/messages'
+import { parseUserMessage, unwrapSteeringText } from '../util/messages'
 
 import type { AgentTemplate, PlaceholderValue } from './types'
 import type { Logger } from '@codebuff/common/types/contracts/logger'
@@ -80,7 +83,7 @@ export async function formatPrompt(
   const lastUserMessage = messageHistory.findLast(isUserInputMessage)
   const lastUserInput = lastUserMessage
     ? (parseUserMessage(lastUserMessage.content[0].text) ??
-      lastUserMessage.content[0].text)
+      unwrapSteeringText(lastUserMessage.content[0].text))
     : undefined
 
   const agentTemplate = agentState.agentType
@@ -140,8 +143,7 @@ export async function formatPrompt(
         return `\`\`\`${path}\n${content.trim()}\n\`\`\``
       })
       if (blocks.length === 0) return ''
-      return `Project instructions:
-Each fenced block below is one instructions file, labeled with its path. Follow them for the rest of the session.
+      return `${PROJECT_INSTRUCTIONS_HEADER}
 
 ${blocks.join('\n\n')}`
     },
@@ -196,9 +198,40 @@ export async function getAgentPrompt<T extends StringField>(
 
   let addendum = ''
 
+  // For non-inherited tools, agents are already defined as tools with full schemas,
+  // so we add the spawnerPrompt for each agent the model can spawn
+  const spawnableAgentsList = async (heading: string) => {
+    const agents = modelSpawnableAgents(agentTemplate)
+    if (agents.length === 0) return ''
+    const agentDescriptions = await Promise.all(
+      agents.map(async (agentType) => {
+        const template = await getAgentTemplate({
+          ...params,
+          agentId: agentType,
+          localAgentTemplates: agentTemplates,
+        })
+        if (template?.spawnerPrompt) {
+          return `- ${agentType}: ${template.spawnerPrompt}`
+        }
+        return `- ${agentType}`
+      }),
+    )
+    return `\n\n${heading}\n\n${agentDescriptions.join('\n')}`
+  }
+  // The list goes once at the end of the system prompt of an agent that asks
+  // for it, and otherwise into the instructions sent after every user prompt.
+  // An agent that inherits its parent's system prompt cannot carry it there.
+  const listInSystemPrompt =
+    agentTemplate.spawnableAgentsInSystemPrompt &&
+    !agentTemplate.inheritParentSystemPrompt
+
   if (promptType.type === 'stepPrompt' && agentState.agentType && prompt) {
     // Put step prompt within a system_reminder tag so agent doesn't think the user just spoke again.
     prompt = `<system_reminder>${prompt}</system_reminder>`
+  }
+
+  if (promptType.type === 'systemPrompt' && listInSystemPrompt) {
+    addendum += await spawnableAgentsList('# Agents you can spawn')
   }
 
   // Add tool instructions, spawnable agents, and output schema prompts to instructionsPrompt
@@ -217,23 +250,10 @@ export async function getAgentPrompt<T extends StringField>(
         })
         addendum += `\n\n${spawnableAgentsSpec}`
       }
-    } else if (spawnableAgents.length > 0) {
-      // For non-inherited tools, agents are already defined as tools with full schemas,
-      // so we add the spawnerPrompt for each agent
-      const agentDescriptions = await Promise.all(
-        spawnableAgents.map(async (agentType) => {
-          const template = await getAgentTemplate({
-            ...params,
-            agentId: agentType,
-            localAgentTemplates: agentTemplates,
-          })
-          if (template?.spawnerPrompt) {
-            return `- ${agentType}: ${template.spawnerPrompt}`
-          }
-          return `- ${agentType}`
-        }),
+    } else if (!listInSystemPrompt) {
+      addendum += await spawnableAgentsList(
+        'You can spawn the following agents:',
       )
-      addendum += `\n\nYou can spawn the following agents:\n\n${agentDescriptions.join('\n')}`
     }
 
     // Add output schema information if defined

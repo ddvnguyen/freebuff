@@ -7,6 +7,7 @@ import {
   withSystemTags,
 } from '@codebuff/agent-runtime/util/messages'
 import { MAX_AGENT_STEPS_DEFAULT } from '@codebuff/common/constants/agents'
+import { BYOK_LOCAL_USER_ID } from '@codebuff/common/constants/byok'
 import { toRepoSnapshot } from '@codebuff/common/util/file'
 import { dropUnansweredToolCalls } from '@codebuff/common/util/messages'
 import {
@@ -18,10 +19,6 @@ import {
   listMCPTools,
   callMCPTool,
 } from '@codebuff/common/mcp/client'
-import {
-  COMPOSIO_META_TOOL_NAMES,
-  isComposioMetaToolName,
-} from '@codebuff/common/constants/composio'
 import { toolNames } from '@codebuff/common/tools/constants'
 import { clientToolCallSchema } from '@codebuff/common/tools/list'
 import { AgentOutputSchema } from '@codebuff/common/types/session-state'
@@ -33,9 +30,9 @@ import {
   isTransientNetworkError,
 } from '@codebuff/common/util/error'
 import { isSensitiveEnvFilePath } from '@codebuff/common/util/env-file-path'
+import { PROJECT_UNDERSTANDING_OUTSIDE_PROJECT_MESSAGE } from '@codebuff/common/project-understanding/non-text-files'
 import { cloneDeep } from 'lodash'
 
-import { executeComposioToolViaServer } from './composio'
 import { byokModelLimits } from './byok'
 import type { ResolvedByokConnection } from './byok'
 import { getErrorStatusCode } from './error-utils'
@@ -53,14 +50,17 @@ import { applyPatchTool } from './tools/apply-patch'
 import { codeSearch } from './tools/code-search'
 import { glob } from './tools/glob'
 import { listDirectory } from './tools/list-directory'
-import { getProjectPathLookupKeys } from './tools/path-utils'
+import { getProjectPathLookupKeys, resolveFilePath } from './tools/path-utils'
+import { createProjectFence } from './tools/project-confinement'
 import { getFiles, getImageFile } from './tools/read-files'
 import { readUrl } from './tools/read-url'
 import { runTerminalCommand } from './tools/run-terminal-command'
 import type { TerminalCommandBroker } from './tools/run-terminal-command'
 
 import type { CustomToolDefinition } from './custom-tool'
+import type { CodebuffRequestHeadersProvider } from './impl/model-provider'
 import type { RunState } from './run-state'
+import type { ProjectFence } from './tools/project-confinement'
 import type { FileFilter } from './tools/read-files'
 import type { ServerAction } from '@codebuff/common/actions'
 import type { FileReadWindow } from '@codebuff/common/types/contracts/client'
@@ -73,6 +73,7 @@ import type {
   ContextCompactionData,
 } from '@codebuff/common/types/contracts/llm'
 import type { TraceWriter } from '@codebuff/common/types/contracts/trace'
+import type { DrainSteeringMessages } from '@codebuff/common/types/contracts/steering'
 import type { CodebuffFileSystem } from '@codebuff/common/types/filesystem'
 import type {
   Message,
@@ -106,6 +107,13 @@ export type OverrideToolHandlers = {
      *  on hosted surfaces window the content themselves (they hold the file
      *  before their own read budget truncates it). */
     fileWindows?: Record<string, FileReadWindow[]>
+    /** Set only when the SDK reads a file to compute an edit (str_replace,
+     *  write_file), never from a model's read_files call. The override must
+     *  then return the whole file, skipping its read budget: an edit computed
+     *  from a truncated read cannot match anything past the cut, and the patch
+     *  it produces carries the truncation notice, so it fails to apply to the
+     *  real file. An override that ignores it keeps that old behaviour. */
+    fullContent?: true
   }) => Promise<Record<string, string | null>>
 }
 
@@ -160,6 +168,13 @@ export type CodebuffClientOptions = {
    * from a publisher account into the host process for no benefit.
    */
   disableAgentRegistry?: boolean
+  /**
+   * Extra headers for every request this client makes to the Codebuff
+   * backend's completions endpoint, computed per request from its final body
+   * (so a host can sign it). Not used by BYOK runs. Omitted: requests are
+   * unchanged. See `CodebuffRequestHeadersProvider`.
+   */
+  requestHeaders?: CodebuffRequestHeadersProvider
 
   cwd?: string
   /** Optional directory path to load skills from. Skills found here will be available to the `skill` tool. */
@@ -185,8 +200,14 @@ export type CodebuffClientOptions = {
    *  `computeProjectIndexFromFiles`). Skips the per-run tree-sitter parse;
    *  ignored when `projectFiles` is absent. */
   projectIndex?: ComputedProjectIndex
+  /** See `InitialSessionStateOptions.skipSymbolIndex`. */
+  skipSymbolIndex?: boolean
   knowledgeFiles?: Record<string, string>
   agentDefinitions?: AgentDefinition[]
+  /** See `InitialSessionStateOptions.agentDirs`: the directories a fresh
+   *  session may import agent modules from when `agentDefinitions` is
+   *  omitted. Defaults to `~/.agents`; never the repository. */
+  agentDirs?: string[]
   maxAgentSteps?: number
   env?: Record<string, string>
   /** Optional host process boundary that keeps terminal tools away from an
@@ -255,16 +276,20 @@ export type RunOptions = {
   allowInferenceSourceChange?: boolean
   extraToolResults?: ToolMessage[]
   signal?: AbortSignal
+  /** Optional wall-clock deadline (Unix milliseconds), used for budget reminders.
+   * The host remains responsible for enforcing its timeout via signal. */
+  deadlineAt?: number
   /** Optional steering hook. Drained at each agent step boundary during the run;
-   * any returned texts are appended to the conversation as user prompts (and keep
+   * any returned messages are appended to the conversation as user prompts (and keep
    * the turn going) before the next LLM call. Lets a host inject messages into a
    * running agent without aborting — i.e. "steer" it, as opposed to queuing a new
-   * prompt for after the turn finishes. */
-  drainSteeringMessages?: () => string[]
+   * prompt for after the turn finishes. Supports plain strings or { prompt, content }
+   * messages with images, and async attachment loading. */
+  drainSteeringMessages?: DrainSteeringMessages
   costMode?: string
   /** Extra key/values merged into each LLM request's `codebuff_metadata`.
    *  Used by hosts (e.g. the CLI) to forward client-scoped identifiers like
-   *  `freebuff_instance_id` that server-side gates read from the request body. */
+   *  `freebuff_instance_id`, sent with the request. */
   extraCodebuffMetadata?: Record<string, string>
   /** Optional checkpoint hook. Called once when the run starts and then
    * periodically while it is in flight, with a RunState snapshot that
@@ -278,8 +303,11 @@ export type RunOptions = {
   onUsage?: (usage: AgentUsageData) => void
   /** A model request ended before an exact provider usage receipt arrived. */
   onUsageIncomplete?: () => void
-  /** Successful model-generated compaction, including the exact saved summary. */
+  /** Successful compaction, including the exact saved summary. */
   onCompaction?: (data: ContextCompactionData) => void
+  /** A compaction pass began. `onCompactionEnd` always follows, after any `onCompaction`. */
+  onCompactionStart?: (data: Pick<ContextCompactionData, 'trigger'>) => void
+  onCompactionEnd?: () => void
   /**
    * The shell this run's terminal commands actually execute in, when the host's
    * broker picks one other than the default (the sponsored Windows floor runs
@@ -290,6 +318,37 @@ export type RunOptions = {
   /** Stable id of the project this run works on. Defaults to a hash of the
    *  repository root resolved from `cwd`. */
   projectKey?: string
+  /** Trace session id for a run with no `previousRun` (a UUID). Lets a host
+   *  know a new conversation's trace session before its first run returns.
+   *  Ignored when `previousRun` carries one. Unset mints a random UUID. */
+  traceSessionId?: string
+  /**
+   * Hold the SDK's own read tools to the project at `cwd`. Off by default:
+   * only the project-understanding agent sets it (docs/freebuff-project-understanding.md).
+   * When true:
+   *  - read_files refuses, per file, any path outside `cwd` as written OR
+   *    through a symlink (realpaths compared), with a
+   *    `[FILE_OUTSIDE_PROJECT]` status, and reads the rest;
+   *  - list_directory refuses a folder outside `cwd`, and glob a `cwd`
+   *    outside it, with a tool error the model can act on; glob also drops
+   *    matches that resolve outside through a symlinked folder;
+   *  - code_search is refused outright: its `cwd` and flags can name any path.
+   * It covers only the SDK's local handlers: an `overrideTools` handler owns
+   * its own policy. Write and terminal tools are untouched.
+   */
+  confineFileToolsToProject?: boolean
+  /**
+   * read_files refuses what the project-understanding agent never reads:
+   * non-text files (images, PDFs, archives, office documents, media, fonts,
+   * binaries, databases: by extension, and any file with a NUL in its first
+   * 4 KB), so an image is never attached; and lockfiles, generated files
+   * (minified bundles, source maps, dependency and build folders) and text
+   * files over 100 KB, refused by path and by size before they are read
+   * (`common/src/project-understanding/skipped-files.ts`). Off by default:
+   * only the project-understanding agent sets it. Local reads only, like
+   * `confineFileToolsToProject`.
+   */
+  refuseNonTextFileReads?: boolean
 }
 
 /**
@@ -412,6 +471,7 @@ export function buildCancelledSessionState(params: {
       contextTokenCount: state.mainAgentState.contextTokenCount,
       previousHistory,
       nextHistory,
+      scale: state.mainAgentState.contextTokenBaseline?.scale,
     },
   )
   return state
@@ -441,7 +501,9 @@ export async function run(options: RunExecutionOptions): Promise<RunState> {
   if (options.previousRun && !previousInference && options.byok && !options.allowInferenceSourceChange) {
     return {
       sessionState: options.previousRun.sessionState,
-      traceSessionId: options.previousRun.traceSessionId ?? crypto.randomUUID(),
+      traceSessionId: options.previousRun.traceSessionId ??
+        options.traceSessionId ??
+        crypto.randomUUID(),
       inference: undefined,
       output: { type: 'error', message: 'This session has no inference source pin; start a new BYOK task.' },
     }
@@ -461,7 +523,9 @@ export async function run(options: RunExecutionOptions): Promise<RunState> {
   ) {
     return {
       sessionState: options.previousRun?.sessionState,
-      traceSessionId: options.previousRun?.traceSessionId ?? crypto.randomUUID(),
+      traceSessionId: options.previousRun?.traceSessionId ??
+        options.traceSessionId ??
+        crypto.randomUUID(),
       inference: previousInference,
       output: { type: 'error', message: 'This session is bound to a different inference connection; start a new task.' },
     }
@@ -473,7 +537,9 @@ export async function run(options: RunExecutionOptions): Promise<RunState> {
     return {
       sessionState: options.previousRun?.sessionState,
       traceSessionId:
-        options.previousRun?.traceSessionId ?? crypto.randomUUID(),
+        options.previousRun?.traceSessionId ??
+        options.traceSessionId ??
+        crypto.randomUUID(),
       inference: requestedInference,
       output: {
         type: 'error',
@@ -501,6 +567,7 @@ async function runOnce({
   byok,
   trustedAgentPublishers,
   disableAgentRegistry,
+  requestHeaders,
 
   cwd,
   skillsDir,
@@ -508,8 +575,10 @@ async function runOnce({
   includeHomeSkills,
   projectFiles,
   projectIndex,
+  skipSymbolIndex,
   knowledgeFiles,
   agentDefinitions,
+  agentDirs,
   maxAgentSteps = MAX_AGENT_STEPS_DEFAULT,
   env,
   terminalCommandBroker,
@@ -534,6 +603,7 @@ async function runOnce({
   previousRun,
   extraToolResults,
   signal,
+  deadlineAt,
   drainSteeringMessages,
   costMode,
   extraCodebuffMetadata,
@@ -541,8 +611,13 @@ async function runOnce({
   onUsage,
   onUsageIncomplete,
   onCompaction,
+  onCompactionStart,
+  onCompactionEnd,
   terminalShell,
   projectKey,
+  traceSessionId: traceSessionIdOption,
+  confineFileToolsToProject,
+  refuseNonTextFileReads,
 }: RunExecutionOptions): Promise<RunState> {
   const fsSourceValue = typeof fsSource === 'function' ? fsSource() : fsSource
   const fs = await fsSourceValue
@@ -579,6 +654,7 @@ async function runOnce({
         customToolDefinitions,
         projectFiles,
         projectIndex,
+        skipSymbolIndex,
         maxAgentSteps,
       },
     )
@@ -591,16 +667,19 @@ async function runOnce({
       includeHomeSkills,
       knowledgeFiles,
       agentDefinitions,
+      agentDirs,
       customToolDefinitions,
       projectFiles,
       projectIndex,
+      skipSymbolIndex,
       maxAgentSteps,
       fs,
       spawn,
       logger,
     })
   }
-  const traceSessionId = previousRun?.traceSessionId ?? crypto.randomUUID()
+  const traceSessionId =
+    previousRun?.traceSessionId ?? traceSessionIdOption ?? crypto.randomUUID()
   applyTerminalShell(sessionState, terminalShell)
 
   if (byok) {
@@ -620,13 +699,10 @@ async function runOnce({
             ? byokTemplate.compactContext
             : {}),
           maxContextLength: limits.maxContextLength,
+          maxOutputTokens: limits.maxOutputTokens,
         }
       }
     }
-  }
-
-  for (const toolName of COMPOSIO_META_TOOL_NAMES) {
-    delete sessionState.fileContext.customToolDefinitions[toolName]
   }
 
   let resolvePromise: (value: RunReturnType) => any = () => {}
@@ -747,6 +823,14 @@ async function runOnce({
     }
   }
 
+  // Opt-in (the project-understanding agent): every other run leaves both unset and
+  // its tools behave exactly as before.
+  const projectFence: ProjectFence | undefined =
+    confineFileToolsToProject && cwd
+      ? createProjectFence({ projectRoot: cwd, fs })
+      : undefined
+  const refuseNonText = refuseNonTextFileReads === true
+
   const agentRuntimeImpl = getAgentRuntimeImpl({
     logger,
     traceWriter,
@@ -754,6 +838,7 @@ async function runOnce({
     byok,
     trustedAgentPublishers,
     disableAgentRegistry,
+    requestHeaders,
     handleStepsLogChunk: () => {
       // Does nothing for now
     },
@@ -778,9 +863,9 @@ async function runOnce({
         fs,
         env: toolEnv,
         terminalCommandBroker,
-        apiKey,
         byok,
         signal,
+        projectFence,
       })
     },
     requestMcpToolData: async ({ mcpConfig, toolNames }) => {
@@ -801,26 +886,59 @@ async function runOnce({
 
       return filteredTools
     },
-    requestFiles: ({ filePaths, fileWindows }) =>
-      readFiles({
-        filePaths,
-        fileWindows,
-        override: overrideTools?.read_files,
-        fileFilter,
-        cwd,
-        fs,
-      }),
+    requestFiles: async ({ filePaths, fileWindows }) => {
+      const read = (paths: string[]) =>
+        readFiles({
+          filePaths: paths,
+          fileWindows,
+          override: overrideTools?.read_files,
+          fileFilter,
+          cwd,
+          fs,
+          ...(refuseNonText ? { refuseNonText } : {}),
+        })
+      if (!projectFence || overrideTools?.read_files) return read(filePaths)
+      // confineFileToolsToProject: refuse each outside path, read the rest.
+      const refused = Object.create(null) as Record<string, string | null>
+      const inside: string[] = []
+      for (const filePath of filePaths) {
+        if (!filePath) continue
+        if (await projectFence.resolve(filePath)) {
+          inside.push(filePath)
+        } else {
+          const { relativePath } = resolveFilePath(
+            requireCwd(cwd, 'read_files'),
+            filePath,
+          )
+          refused[relativePath] =
+            `${FILE_READ_STATUS.OUTSIDE_PROJECT} ${PROJECT_UNDERSTANDING_OUTSIDE_PROJECT_MESSAGE}`
+        }
+      }
+      const loaded = inside.length > 0 ? await read(inside) : {}
+      return { ...refused, ...loaded }
+    },
     // Only a local read can return an image's bytes. An override reads a
     // remote workspace through the text-only contract, so it keeps images.
-    requestImageFile: overrideTools?.read_files
-      ? undefined
-      : ({ filePath }) =>
-          getImageFile({
-            filePath,
-            cwd: requireCwd(cwd, 'read_files'),
-            fs,
-            fileFilter,
-          }),
+    // refuseNonTextFileReads leaves images to the text read, which refuses
+    // them.
+    requestImageFile:
+      overrideTools?.read_files || refuseNonText
+        ? undefined
+        : async ({ filePath }) => {
+            const imageCwd = requireCwd(cwd, 'read_files')
+            if (projectFence && !(await projectFence.resolve(filePath))) {
+              return {
+                path: resolveFilePath(imageCwd, filePath).relativePath,
+                error: `${FILE_READ_STATUS.OUTSIDE_PROJECT} ${PROJECT_UNDERSTANDING_OUTSIDE_PROJECT_MESSAGE}`,
+              }
+            }
+            return getImageFile({
+              filePath,
+              cwd: imageCwd,
+              fs,
+              fileFilter,
+            })
+          },
     requestOptionalFile: async ({ filePath }) => {
       const files = await readFiles({
         filePaths: [filePath],
@@ -901,7 +1019,7 @@ async function runOnce({
   if (byok) {
     // BYOK is intentionally auth-free: no Codebuff identity, run ledger,
     // token-count, analytics, or helper request is necessary for inference.
-    userId = requestedUserId ?? 'byok-local'
+    userId = requestedUserId ?? BYOK_LOCAL_USER_ID
   } else {
     let userInfo: { id: string } | null
     try {
@@ -1021,6 +1139,7 @@ async function runOnce({
       agentId,
     },
     drainSteeringMessages,
+    deadlineAt,
     repoUrl: undefined,
     repoId: undefined,
     clientSessionId: promptId,
@@ -1037,14 +1156,21 @@ async function runOnce({
     onAgentUsageReceived: report(onUsage),
     onAgentUsageIncomplete: reportSignal(onUsageIncomplete),
     onCompaction: report(onCompaction),
+    onCompactionStart: report(onCompactionStart),
+    onCompactionEnd: reportSignal(onCompactionEnd),
   }).catch((error) => {
-    let errorMessage = isFetchIdleTimeoutError(error)
-      ? FETCH_IDLE_TIMEOUT_USER_MESSAGE
-      : isTransientNetworkError(error)
-        ? TRANSIENT_NETWORK_ERROR_USER_MESSAGE
-        : error instanceof Error
-          ? error.message
-          : String(error ?? '')
+    // A caller's own deadline (`AbortSignal.timeout`) rejects with a
+    // `TimeoutError`, the same name Bun's 5-minute fetch idle timeout uses, so
+    // the idle copy is only honest when the caller did NOT abort.
+    let errorMessage = signal?.aborted
+      ? createAbortError(signal).message
+      : isFetchIdleTimeoutError(error)
+        ? FETCH_IDLE_TIMEOUT_USER_MESSAGE
+        : isTransientNetworkError(error)
+          ? TRANSIENT_NETWORK_ERROR_USER_MESSAGE
+          : error instanceof Error
+            ? error.message
+            : String(error ?? '')
     const apiErrorDetails = extractApiErrorDetails(error)
     const statusCode = apiErrorDetails.statusCode ?? getErrorStatusCode(error)
     const {
@@ -1094,6 +1220,7 @@ async function readFiles({
   fs,
   limitContent,
   enforceEnvPolicy = true,
+  refuseNonText,
 }: {
   filePaths: string[]
   fileWindows?: Record<string, FileReadWindow[]>
@@ -1105,6 +1232,8 @@ async function readFiles({
   fs: CodebuffFileSystem
   limitContent?: boolean
   enforceEnvPolicy?: boolean
+  /** RunOptions.refuseNonTextFileReads; local reads only. */
+  refuseNonText?: boolean
 }) {
   if (override) {
     // Windows are forwarded, not applied here: an override reads from a remote
@@ -1116,6 +1245,11 @@ async function readFiles({
       return await override({
         filePaths,
         ...(fileWindows ? { fileWindows } : {}),
+        // `limitContent: false` is the edit path's read (requestOptionalFile).
+        // Without forwarding it, the override applied the model-facing read
+        // budget (~20k estimated tokens, roughly 65k characters) and every
+        // str_replace past that offset was "not found".
+        ...(limitContent === false ? { fullContent: true as const } : {}),
       })
     }
 
@@ -1133,6 +1267,7 @@ async function readFiles({
       const loadedFiles = await override({
         filePaths: readablePaths,
         ...(fileWindows ? { fileWindows } : {}),
+        ...(limitContent === false ? { fullContent: true as const } : {}),
       })
       if (
         !loadedFiles ||
@@ -1157,7 +1292,37 @@ async function readFiles({
     fileFilter,
     limitContent,
     enforceEnvPolicy,
+    ...(refuseNonText ? { refuseNonText } : {}),
   })
+}
+
+function confinedToolError(errorMessage: string): ToolResultOutput[] {
+  return [{ type: 'json', value: { errorMessage } }]
+}
+
+/** glob under confineFileToolsToProject: a symlinked folder inside the project
+ *  can point anywhere, and the project scan follows it, so a match is kept
+ *  only when its real path is inside the project too. */
+async function dropMatchesOutsideProject(
+  output: ToolResultOutput[],
+  fence: ProjectFence,
+): Promise<ToolResultOutput[]> {
+  return Promise.all(
+    output.map(async (part) => {
+      if (part.type !== 'json') return part
+      const value = part.value as { files?: unknown }
+      if (!value || !Array.isArray(value.files)) return part
+      const kept: string[] = []
+      for (const file of value.files) {
+        if (typeof file === 'string' && (await fence.resolve(file))) {
+          kept.push(file)
+        }
+      }
+      return kept.length === value.files.length
+        ? part
+        : { ...part, value: { ...(part.value as object), files: kept } }
+    }),
+  ) as Promise<ToolResultOutput[]>
 }
 
 async function handleToolCall({
@@ -1168,9 +1333,9 @@ async function handleToolCall({
   fs,
   env,
   terminalCommandBroker,
-  apiKey,
   byok,
   signal,
+  projectFence,
 }: {
   action: ServerAction<'tool-call-request'>
   overrides: NonNullable<CodebuffClientOptions['overrideTools']>
@@ -1179,9 +1344,10 @@ async function handleToolCall({
   fs: CodebuffFileSystem
   env?: Record<string, string>
   terminalCommandBroker?: TerminalCommandBroker
-  apiKey: string
   byok?: ResolvedByokConnection
   signal?: AbortSignal
+  /** RunOptions.confineFileToolsToProject: unset for every other run. */
+  projectFence?: ProjectFence
 }): Promise<{ output: ToolResultOutput[] }> {
   const toolName = action.toolName
   const input = action.input
@@ -1301,16 +1467,37 @@ async function handleToolCall({
         terminalCommandBroker,
       } as Parameters<typeof runTerminalCommand>[0])
     } else if (toolName === 'read_url') {
-      result = await readUrl({
-        ...(input as Parameters<typeof readUrl>[0]),
-        signal,
-      })
+      // Only the tool's own parameters: the transport and SSRF options are
+      // the host's, never the tool call's.
+      const { url, max_chars } = input as { url: string; max_chars?: number }
+      result = await readUrl({ url, max_chars, signal })
+    } else if (toolName === 'code_search' && projectFence) {
+      result = confinedToolError(
+        'code_search is not available in this run: it cannot be held to the project directory. Use glob and read_files instead.',
+      )
     } else if (toolName === 'code_search') {
       result = await codeSearch({
         projectPath: requireCwd(cwd, 'code_search'),
         ...input,
         signal,
       } as Parameters<typeof codeSearch>[0])
+    } else if (toolName === 'list_directory' && projectFence) {
+      const directoryPath = (input as { path: string }).path
+      const projectPath = requireCwd(cwd, 'list_directory')
+      const fullPath = await projectFence.resolve(directoryPath, {
+        allowRoot: true,
+      })
+      result = fullPath
+        ? (
+            await listDirectory({ directoryPath: fullPath, projectPath, fs })
+          ).map((part) =>
+            part.type === 'json' && 'files' in part.value
+              ? { ...part, value: { ...part.value, path: directoryPath } }
+              : part,
+          )
+        : confinedToolError(
+            `Failed to list directory: ${directoryPath} is outside the project. Only folders inside the project directory can be listed.`,
+          )
     } else if (toolName === 'list_directory') {
       result = await listDirectory({
         directoryPath: (input as { path: string }).path,
@@ -1323,13 +1510,26 @@ async function handleToolCall({
         cwd?: string
         max_results?: number
       }
-      result = await glob({
-        pattern: globInput.pattern,
-        projectPath: requireCwd(cwd, 'glob'),
-        cwd: globInput.cwd,
-        maxResults: globInput.max_results,
-        fs,
-      })
+      if (
+        projectFence &&
+        globInput.cwd !== undefined &&
+        !(await projectFence.resolve(globInput.cwd, { allowRoot: true }))
+      ) {
+        result = confinedToolError(
+          `Failed to search for files: cwd ${globInput.cwd} is outside the project. Only the project directory can be searched.`,
+        )
+      } else {
+        result = await glob({
+          pattern: globInput.pattern,
+          projectPath: requireCwd(cwd, 'glob'),
+          cwd: globInput.cwd,
+          maxResults: globInput.max_results,
+          fs,
+        })
+        if (projectFence) {
+          result = await dropMatchesOutsideProject(result, projectFence)
+        }
+      }
     } else if (toolName === 'run_file_change_hooks') {
       // No-op: SDK doesn't run file change hooks
       result = [
@@ -1340,15 +1540,6 @@ async function handleToolCall({
           },
         },
       ]
-    } else if (isComposioMetaToolName(toolName)) {
-      if (byok) {
-        throw new Error('Composio tools are unavailable in a direct BYOK run')
-      }
-      result = await executeComposioToolViaServer({
-        apiKey,
-        toolName,
-        input,
-      })
     } else {
       throw new Error(
         `Tool not implemented in SDK. Please provide an override or modify your agent to not use this tool: ${toolName}`,
@@ -1469,7 +1660,9 @@ async function handlePromptResponse({
 
     const statusCode = extractStatusCodeFromMessage(action.message)
     resolve({
-      sessionState: initialSessionState,
+      // A snapshot, not the object the runtime was handed: the host keeps and
+      // resends this state, so it must not alias anything still in flight.
+      sessionState: cloneSessionState(initialSessionState),
       traceSessionId,
       output: {
         type: 'error',
@@ -1485,7 +1678,7 @@ async function handlePromptResponse({
       const message = [
         'Received invalid prompt response from server:',
         JSON.stringify(parsedOutput.error.issues),
-        'If this issues persists, please contact support@codebuff.com',
+        'If this issues persists, please contact support@freebuff.com',
       ].join('\n')
       onError({ message })
       resolve({

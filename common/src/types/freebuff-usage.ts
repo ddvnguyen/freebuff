@@ -9,12 +9,22 @@
  */
 
 export interface FreebuffUsageStreakSummary {
-  /** Days in the current run. Survives today being unused until tomorrow. */
+  /** Days in the current run. Survives today being unused until tomorrow.
+   *  Counted on the account's own days (the daily allowance's interval), the
+   *  same streak the CLI and Desktop show and the +15 is paid on; the
+   *  activity map and `longest` stay on Pacific dates. */
   current: number
-  /** Longest run in recorded history. */
+  /** Longest run in recorded history (never below `current`). */
   longest: number
   todayUsed: boolean
   lastUsageDate: string | null
+  /**
+   * When the current streak day ends, as an ISO instant: the account's daily
+   * reset (its own midnight). Absent from older servers, and when the account
+   * day could not be read (the streak above is then the Pacific one, ending
+   * at the next midnight in `timeZone`).
+   */
+  nextResetAt?: string
 }
 
 /**
@@ -38,14 +48,6 @@ export interface FreebuffRecentUsage {
    *  `inputTokens`, and re-adding it inflates the total ~1.8x at agentic cache
    *  hit rates. */
   totalTokens: number
-  /**
-   * Model spend over the same window: what these requests cost at list price,
-   * USD, rounded to cents. An estimate the user can quote, never a bill.
-   * ABSENT when the operator has closed the dollar figure to this account
-   * (`FREEBUFF_MODEL_SPEND_AUDIENCE`), so a client that finds it missing simply
-   * has no card to draw — no audience logic lives client-side.
-   */
-  modelSpendUsd?: number
 }
 
 export interface FreebuffUsageSessionsByModel {
@@ -73,4 +75,47 @@ export interface FreebuffUsageSummary {
   recent: FreebuffRecentUsage | null
   /** Sessions admitted per model over the last 30 days, busiest first. */
   sessionsByModel: FreebuffUsageSessionsByModel[]
+  /**
+   * The account's own charges and returns, newest first, over a short window.
+   * Optional: absent from a server that predates it, and an empty array from
+   * one whose ledger read failed — the UI says so rather than showing nothing.
+   */
+  sessionCharges?: FreebuffSessionLedgerEntry[]
+  /** How many days `sessionCharges` covers, so the UI can label it. */
+  sessionChargesDays?: number
+}
+
+/**
+ * One session's charge and what came back from it — the per-session line the
+ * account hub lists so a user can see where their hours went without asking
+ * support for it.
+ *
+ * Amounts are FREEBUCKS, as everywhere on the wire; the client converts to
+ * hours for display. `charged` is positive; `returned` is positive too (the
+ * ledger stores it as a negative amount) and is 0 when nothing came back.
+ */
+export interface FreebuffSessionLedgerEntry {
+  /** The debit's ledger row id, so a client can key the row. */
+  id: string
+  /** When the session was charged, as an ISO instant. */
+  occurredAt: string
+  /** The model the session ran on; null on a legacy row that recorded none. */
+  model: string | null
+  /** Freebucks taken when the session started. */
+  charged: number
+  /** Of `charged`, the part drawn from the wallet rather than the day's pool. */
+  chargedFromWallet: number
+  /** Freebucks given back when the hour settled; 0 if nothing came back. */
+  returned: number
+  /** Of `returned`, the part credited back to the wallet. */
+  returnedToWallet: number
+  /** Why the return was written: a settled hour, or a session that never
+   *  started (`failed_start_refund`). Absent while nothing has come back. */
+  returnReason?: string
+  /**
+   * When the hour can still return something, as an ISO instant. Absent once
+   * the hour is over: a row with no `returned` and no `settlesAt` used its
+   * whole hour, which is correct rather than a missed refund.
+   */
+  settlesAt?: string
 }

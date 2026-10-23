@@ -5,7 +5,7 @@ import path from 'node:path'
 import { afterEach, describe, expect, test } from 'bun:test'
 
 import { CodebuffClient } from '../client'
-import { createByokConnectionStore, type ByokConnection } from '../byok'
+import { ByokConnectionStateError, createByokConnectionStore, type ByokConnection } from '../byok'
 import { getWebsiteUrl } from '../constants'
 import type { RunState } from '../run-state'
 
@@ -40,22 +40,12 @@ describe('direct BYOK SDK runs', () => {
   const originalFetch = globalThis.fetch
   afterEach(() => { globalThis.fetch = originalFetch })
 
-  test('manual compaction uses the provider tool channel and resumes from the exact saved summary', async () => {
-    const summary = '## Objective\nDocument retry behavior.\n## Important Details\n- uploader.ts retries only network failures.\n## Work State\n### Completed\n- Retry implemented.\n### Active\n- Documentation.\n### Blocked\n- (none)\n## Next Move\n1. Update docs/uploads.md.\n## Relevant Files\n- uploader.ts: retries use milliseconds.'
+  test('manual compaction makes no provider request and resumes from the saved summary', async () => {
     const requests: any[] = []
     globalThis.fetch = (async (input, init) => {
       expect(String(input)).toBe('http://127.0.0.1:9876/v1/chat/completions')
       const body = JSON.parse(String(init?.body))
       requests.push(body)
-      const compacting = body.tools?.some((t: any) => t.function.name === 'complete_compaction')
-      if (compacting) {
-        expect(body.model).toBe('scripted/model')
-        expect(body.tool_choice).toBe('required')
-        expect(body.tools.map((t: any) => t.function.name)).toEqual(['complete_compaction'])
-        expect(JSON.stringify(body.messages)).toContain('READ_FINDING: timeout uses milliseconds')
-        return sse({ id: 'summary', object: 'chat.completion.chunk', created: 1, model: body.model,
-          choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'compact', type: 'function', function: { name: 'complete_compaction', arguments: JSON.stringify({ summary }) } }] }, finish_reason: 'tool_calls' }] })
-      }
       return sse({ id: 'work', object: 'chat.completion.chunk', created: 1, model: body.model,
         choices: [{ index: 0, delta: { content: requests.length === 1 ? 'READ_FINDING: timeout uses milliseconds. '.repeat(1000) : 'Documented.' }, finish_reason: 'stop' }] })
     }) as typeof fetch
@@ -63,18 +53,20 @@ describe('direct BYOK SDK runs', () => {
     const original = await client.run({ agent: agent.id, prompt: 'Document retry behavior.' })
     expect(original.output.type).not.toBe('error')
     const saved = JSON.stringify(original)
-    const receipts: unknown[] = []
+    const receipts: Array<{ trigger: string; summary?: string }> = []
     const compacted = await client.run({ agent: agent.id, prompt: '/compact', previousRun: original, onCompaction: (receipt) => receipts.push(receipt) })
     expect(compacted.output.type).not.toBe('error')
-    expect(requests).toHaveLength(2)
-    expect(receipts).toMatchObject([{ trigger: 'manual', summary }])
+    expect(requests).toHaveLength(1)
+    expect(receipts).toHaveLength(1)
+    expect(receipts[0].trigger).toBe('manual')
+    expect(receipts[0].summary).toContain('READ_FINDING')
+    expect(receipts[0].summary).toContain('[...truncated')
     expect(JSON.stringify(original)).toBe(saved)
     const resumed = await client.run({ agent: agent.id, prompt: 'Continue.', previousRun: JSON.parse(JSON.stringify(compacted)) })
     expect(resumed.output.type).not.toBe('error')
-    expect(requests).toHaveLength(3)
-    expect(JSON.stringify(requests.at(-1).messages)).toContain(summary.replaceAll('\n', '\\n'))
-    expect(JSON.stringify(requests.at(-1).messages)).not.toContain('READ_FINDING')
-    expect(requests.at(-1).tools.some((t: any) => t.function.name === 'complete_compaction')).toBe(false)
+    expect(requests).toHaveLength(2)
+    expect(JSON.stringify(requests.at(-1).messages)).toContain('<conversation_summary>')
+    expect(JSON.stringify(requests.at(-1).messages).length).toBeLessThan(JSON.stringify(requests[0].messages).length + 40_000)
   })
 
   test('runs a real local write-file tool loop without any Codebuff request', async () => {
@@ -176,9 +168,11 @@ describe('direct BYOK SDK runs', () => {
 
   test('refuses server-side web_search without contacting a hosted backend', async () => {
     const requests: string[] = []
+    const bodies: string[] = []
     let step = 0
-    globalThis.fetch = (async (input: Parameters<typeof fetch>[0]) => {
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       requests.push(String(input))
+      bodies.push(String(init?.body))
       step += 1
       if (step === 1) {
         return sse({ id: 'tool', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'search', type: 'function', function: { name: 'web_search', arguments: JSON.stringify({ query: 'test' }) } }] }, finish_reason: 'tool_calls' }] })
@@ -193,6 +187,8 @@ describe('direct BYOK SDK runs', () => {
     expect(result.output.type).not.toBe('error')
     expect(requests).toHaveLength(2)
     expect(requests.every((url) => url === 'http://127.0.0.1:9876/v1/chat/completions')).toBe(true)
+    // The refusal is what the model sees as the tool result.
+    expect(bodies[1]).toContain('unavailable in a direct BYOK run')
   })
 
   test('explicit connection recovery retains history, repins checkpoints, and can return to hosted inference', async () => {
@@ -271,7 +267,10 @@ describe('direct BYOK SDK runs', () => {
       requests.push(String(input))
       return new Response(JSON.stringify({ error: { message: 'provider-key-canary must not leak' } }), {
         status,
-        headers: { 'content-type': 'application/json' },
+        // The AI SDK retries a 429 three times, 2s/4s/8s apart unless the
+        // provider says otherwise; `retry-after-ms` (OpenAI's header) keeps
+        // every retry and none of the 14s wait.
+        headers: { 'content-type': 'application/json', 'retry-after-ms': '0' },
       })
     }) as typeof fetch
 
@@ -282,26 +281,100 @@ describe('direct BYOK SDK runs', () => {
     if (result.output.type !== 'error') throw new Error('expected BYOK provider error')
     expect(result.output.message).toContain(expected)
     expect(result.output.message).not.toContain('provider-key-canary')
-    expect(requests).not.toHaveLength(0)
+    // 401/402 are final; a 429 is the first try plus the AI SDK's three retries.
+    expect(requests).toHaveLength(status === 429 ? 4 : 1)
     expect(requests.every((url) => url === 'http://127.0.0.1:9876/v1/chat/completions')).toBe(true)
   }, 30_000)
 
-  test('stops before provider dispatch when a saved connection was replaced or removed', async () => {
+  test.each([
+    ['changed', 'BYOK connection changed; select its current revision to continue'],
+    ['removed', 'BYOK connection was removed; select another provider or a Freebuff model to continue'],
+    ['corrupt', 'BYOK connection metadata is corrupt; restore it before continuing'],
+    ['locked', 'BYOK settings are locked. Close other Freebuff processes and retry.'],
+    ['unknown', 'Could not verify the saved BYOK connection. Reselect the provider and retry.'],
+  ])('reports a %s local connection failure without provider dispatch', async (failure, expected) => {
     let requests = 0
     globalThis.fetch = (async () => {
       requests += 1
       return sse({ id: 'unexpected', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [] })
     }) as unknown as typeof fetch
+    let records: ByokConnection[] = []
+    let failCheck = false
+    const store = createByokConnectionStore({
+      metadataStore: {
+        async get() { return records },
+        async set(next) { records = next },
+        async withLock(operation) {
+          if (failCheck && failure === 'locked')
+            throw new ByokConnectionStateError(expected)
+          if (failCheck && failure === 'unknown')
+            throw new Error('provider-key-canary must not leak')
+          return operation()
+        },
+      },
+      secretStore: {
+        async get() { return 'provider-key-canary' },
+        async set() {},
+        async delete() {},
+      },
+    })
+    const saved = await store.create({
+      name: 'Local failure test', provider: 'openrouter', model: 'scripted/model',
+      credentialRef: 'env:PROVIDER_KEY',
+    })
+    const resolved = await store.resolve(saved)
+    if (failure === 'changed') await store.update({ ...saved, patch: { model: 'new/model' } })
+    if (failure === 'removed') await store.remove(saved)
+    if (failure === 'corrupt') records = [{ ...saved, model: '' }]
+    failCheck = true
     const client = new CodebuffClient({
       agentDefinitions: [agent],
-      byok: connection({ assertCurrent: async () => { throw new Error('connection revision no longer current') } }),
+      byok: resolved,
     })
 
-    const result = await client.run({ agent: agent.id, prompt: 'Do not use the replaced connection.' })
+    const result = await client.run({ agent: agent.id, prompt: 'Do not use the unavailable connection.' })
     expect(result.output.type).toBe('error')
     if (result.output.type !== 'error') throw new Error('expected BYOK connection error')
-    expect(result.output.message).toContain('Could not connect to the BYOK provider')
+    expect(result.output.message).toContain(expected)
+    expect(result.output.message).not.toContain('provider-key-canary')
+    expect(result.output.message).not.toContain('network connection')
     expect(requests).toBe(0)
+  }, 30_000)
+
+  test.each(['missing-finish', 'empty', 'transport'])('reports repeated %s responses without blaming the user network', async (ending) => {
+    const requests: string[] = []
+    globalThis.fetch = (async (input) => {
+      requests.push(String(input))
+      if (ending === 'transport') {
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.error(Object.assign(new Error('provider-key-canary must not leak'), {
+              code: 'ECONNRESET',
+            }))
+          },
+        }), { headers: { 'content-type': 'text/event-stream' } })
+      }
+      // [DONE] alone is not a supported finish_reason, even when text arrived.
+      return ending === 'empty'
+        ? new Response('', { headers: { 'content-type': 'text/event-stream' } })
+        : sse({ choices: [{ delta: { content: 'Partial output.' }, finish_reason: null }] })
+    }) as typeof fetch
+    const client = new CodebuffClient({
+      agentDefinitions: [agent], byok: connection(), handleEvent: () => {},
+    })
+    const result = await client.run({ agent: agent.id, prompt: 'Fail safely on repeated incomplete responses.' })
+
+    expect(result.output.type).toBe('error')
+    if (result.output.type !== 'error') throw new Error('expected incomplete BYOK response error')
+    expect(result.output.message).toContain('could not confirm that the provider finished')
+    expect(result.output.message).toContain('connection problem or an incompatible provider response')
+    expect(result.output.message).toContain(ending === 'transport'
+      ? 'Last error: A connection-level error occurred'
+      : 'Last error: The provider response had no recognised completion status or token usage.')
+    expect(result.output.message).not.toContain('Please check your network connection')
+    expect(result.output.message).not.toContain('provider-key-canary')
+    expect(requests).toHaveLength(4)
+    expect(requests.every((url) => url === 'http://127.0.0.1:9876/v1/chat/completions')).toBe(true)
   }, 30_000)
 
   test('returns a local cancellation result without provider or hosted fallback requests', async () => {

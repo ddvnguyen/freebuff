@@ -16,6 +16,12 @@ import {
   createFileReadLimiter,
   windowFileRead,
 } from '@codebuff/common/util/file-read-limits'
+import {
+  PROJECT_UNDERSTANDING_NON_TEXT_MESSAGE,
+  isProjectUnderstandingNonTextPath,
+  looksLikeBinaryContent,
+} from '@codebuff/common/project-understanding/non-text-files'
+import { projectUnderstandingReadRefusal } from '@codebuff/common/project-understanding/skipped-files'
 
 import { resolveFilePath } from './path-utils'
 
@@ -50,6 +56,15 @@ export async function getFiles(params: {
    * checks for env templates.
    */
   fileFilter?: FileFilter
+  /**
+   * Refuse what the project-understanding agent never reads: non-text files
+   * (by extension before reading, and by a NUL in the first 4 KB after), and
+   * lockfiles, generated files and files over 100 KB (by path, then by the
+   * stat's size, before reading; skipped-files.ts). Off by default; only the
+   * project-understanding agent's run sets it
+   * (`RunOptions.refuseNonTextFileReads`).
+   */
+  refuseNonText?: boolean
 }) {
   const {
     filePaths,
@@ -59,9 +74,10 @@ export async function getFiles(params: {
     fileFilter,
     limitContent = true,
     enforceEnvPolicy = true,
+    refuseNonText = false,
   } = params
   // If the caller provides a filter, they own additional filtering decisions.
-  // Otherwise the SDK also applies default gitignore checking.
+  // Otherwise explicit reads honor agent ignore files, not discovery exclusions.
   const hasCustomFilter = fileFilter !== undefined
 
   const result = Object.create(null) as Record<string, string | null>
@@ -88,6 +104,19 @@ export async function getFiles(params: {
       continue
     }
 
+    if (refuseNonText && isProjectUnderstandingNonTextPath(relativePath)) {
+      result[relativePath] =
+        `${FILE_READ_STATUS.IGNORED} ${PROJECT_UNDERSTANDING_NON_TEXT_MESSAGE}`
+      continue
+    }
+    const pathRefusal = refuseNonText
+      ? projectUnderstandingReadRefusal(relativePath)
+      : null
+    if (pathRefusal) {
+      result[relativePath] = pathRefusal
+      continue
+    }
+
     // Apply file filter if provided
     const filterResult = fileFilter?.(relativePath)
     if (filterResult?.status === 'blocked') {
@@ -99,14 +128,15 @@ export async function getFiles(params: {
     const isExampleFile =
       isEnvTemplate || filterResult?.status === 'allow-example'
 
-    // Custom-filter callers own ordinary filtering decisions, except that env
-    // templates must still obey gitignore when the read_files policy is active.
+    // Explicit reads may name Git-ignored artifacts. Keep the full discovery
+    // policy for env templates and the background project-understanding agent.
     if ((!hasCustomFilter || isEnvTemplate) && isWithinProject) {
       const ignored = await isFileIgnored({
         filePath: relativePath,
         projectRoot: cwd,
         fs,
         ...(isEnvTemplate ? { allowEnvTemplate: true } : {}),
+        ...(!isEnvTemplate && !refuseNonText ? { explicitRead: true } : {}),
       })
       if (ignored) {
         result[relativePath] = FILE_READ_STATUS.IGNORED
@@ -123,8 +153,20 @@ export async function getFiles(params: {
           ` [${(stats.size / (1024 * 1024)).toFixed(1)}MB exceeds 10MB limit. Use code_search or glob to find specific content.]`
         continue
       }
+      const sizeRefusal = refuseNonText
+        ? projectUnderstandingReadRefusal(relativePath, stats.size)
+        : null
+      if (sizeRefusal) {
+        result[relativePath] = sizeRefusal
+        continue
+      }
 
       const content = await fs.readFile(fullPath, 'utf8')
+      if (refuseNonText && looksLikeBinaryContent(content)) {
+        result[relativePath] =
+          `${FILE_READ_STATUS.IGNORED} ${PROJECT_UNDERSTANDING_NON_TEXT_MESSAGE}`
+        continue
+      }
 
       const windows = fileWindows?.[filePath]
       const windowedContent =
@@ -189,13 +231,21 @@ export async function getImageFile(params: {
         ` [${ext} images cannot be attached; models accept only PNG, JPEG, GIF and WebP. Convert it with a terminal command (for example \`magick ${relativePath} /tmp/preview.png\`) and read that instead.]`,
     }
   }
-  if (fileFilter?.(relativePath).status === 'blocked') {
+  if (
+    isSensitiveEnvFilePath(relativePath) ||
+    fileFilter?.(relativePath).status === 'blocked'
+  ) {
     return { path: relativePath, error: FILE_READ_STATUS.IGNORED }
   }
   if (
     !fileFilter &&
     isWithinProject &&
-    (await isFileIgnored({ filePath: relativePath, projectRoot: cwd, fs }))
+    (await isFileIgnored({
+      filePath: relativePath,
+      projectRoot: cwd,
+      fs,
+      explicitRead: true,
+    }))
   ) {
     return { path: relativePath, error: FILE_READ_STATUS.IGNORED }
   }
