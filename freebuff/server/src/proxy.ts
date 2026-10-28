@@ -4,6 +4,7 @@ import { renderLoginPage } from './login-page'
 const LOGIN_PATH = '/__freebuff/login'
 const LOGOUT_PATH = '/__freebuff/logout'
 const HEALTH_PATH = '/__freebuff/health'
+const LOGIN_START_PATH = '/api/auth/login/start'
 const HOP_BY_HOP = new Set([
   'connection',
   'keep-alive',
@@ -107,6 +108,17 @@ function rewriteLocation(value: string, port: number): string {
     }
   }
   return value
+}
+
+/**
+ * The orchestrator builds its sign-in launch URL from its own loopback origin
+ * and returns it in a JSON body, which the browser would follow to a port only
+ * this host can reach. Strip the origin so the URL resolves through the proxy.
+ */
+function rewriteBodyOrigins(value: string, port: number): string {
+  return value
+    .replaceAll(upstreamOrigin(port), '')
+    .replaceAll(`http://localhost:${port}`, '')
 }
 
 function originAllowed(request: Request): boolean {
@@ -399,7 +411,15 @@ async function proxyHttp(
     upstream.status === 204 ||
     upstream.status === 304
       ? null
-      : upstream.body
+      : url.pathname === LOGIN_START_PATH &&
+          upstream.headers
+            .get('content-type')
+            ?.includes('application/json')
+        ? rewriteBodyOrigins(
+            await upstream.text(),
+            options.orchestratorPort,
+          )
+        : upstream.body
   return new Response(body, {
     status: upstream.status,
     statusText: upstream.statusText,
@@ -412,6 +432,11 @@ export function startProxy(options: ProxyOptions): ProxyHandle {
     hostname: options.hostname,
     port: options.port,
     ...(options.tls ? { tls: options.tls } : {}),
+    // Bun closes connections idle for 10s by default. The orchestrator only
+    // pings /api/events every 25s, so a quiet desktop UI would lose its event
+    // stream on every idle interval. Keep the connection open for the longest
+    // interval Bun allows; the orchestrator sets idleTimeout: 0 itself.
+    idleTimeout: 255,
     maxRequestBodySize: 256 * 1024 * 1024,
     fetch: async (request, server) => {
       const url = new URL(request.url)
