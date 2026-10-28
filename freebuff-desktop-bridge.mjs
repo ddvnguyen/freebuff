@@ -7,14 +7,37 @@
 // (e.g. a token file / FB_HOME dir) the bridge resolves itself. Credentials
 // never travel through Multica's DB.
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
-const FB_URL = process.env.FREEBUFF_DESKTOP_URL || process.env.FB_URL || "http://localhost:4320";
+const FB_URL = (process.env.FREEBUFF_DESKTOP_URL || process.env.FB_URL || "http://localhost:4320").replace(/\/+$/, "");
 const CREDENTIAL_REF = process.env.FREEBUFF_DESKTOP_CREDENTIAL_REF || process.env.FB_HOME || "";
-const HOME_DIR = CREDENTIAL_REF || (existsSync("/mnt/workspace/work/lane-c/state.json") ? "/mnt/workspace/work/lane-c" : "/mnt/workspace/work/freebuff-session");
+// Per-account state (the reusable thread id) lives in the directory the
+// credential reference names; without one it lives under the working directory
+// of the run, or FREEBUFF_DESKTOP_STATE_DIR when set. Never a fixed host path.
+const HOME_DIR = resolve(CREDENTIAL_REF || process.env.FREEBUFF_DESKTOP_STATE_DIR || join(process.cwd(), ".freebuff-desktop"));
 
-// --list-models --json: emit the codebuddy-compatible model list and exit.
+// --list-models [--json]: report what THIS account can run, then exit.
+//
+// Freebuff Desktop picks the model itself, so the only per-account fact is
+// whether the account at FB_URL is reachable and signed in. An account that is
+// not exits non-zero with the reason, so Multica reports that account as
+// failed instead of advertising a model it cannot run.
 if (process.argv.includes("--list-models")) {
+  let status;
+  try {
+    const r = await fetch(FB_URL + "/api/auth/status", { signal: AbortSignal.timeout(10000) });
+    if (!r.ok) throw new Error(`GET /api/auth/status -> ${r.status}`);
+    status = await r.json();
+  } catch (e) {
+    console.error(`freebuff desktop at ${FB_URL} is not reachable: ${e.message}`);
+    process.exit(1);
+  }
+  if (!status.authed) {
+    console.error(`freebuff desktop at ${FB_URL} is not signed in`);
+    process.exit(1);
+  }
+  // One entry, the same for every account: Multica merges accounts by model id
+  // and tags each with the accounts that answered.
   const models = [{ id: "freebuff-desktop", name: "Freebuff Desktop", provider: "freebuff" }];
   if (process.argv.includes("--json")) {
     process.stdout.write(JSON.stringify({ models, supported: true }) + "\n");
