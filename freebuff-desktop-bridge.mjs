@@ -242,18 +242,105 @@ if (tinfo?.turnState === "running") {
 }
 for (let i = 0; i < 60; i++) { const t = await threadState(); if (t.turnState !== "running") break; await sleep(5000); }
 
+// Subscribe to the desktop's event SSE BEFORE posting so the baseline (highest
+// seq already published for this thread) separates replay from our turn.
+async function openEvents() {
+  const r = await fetch(FB_URL + "/api/events", { headers: { accept: "text/event-stream" } });
+  if (!r.ok || !r.body) throw new Error(`GET /api/events -> ${r.status}`);
+  return r.body.getReader();
+}
+const EVENTS_READER = await openEvents();
+let eventsBuf = "";
+// Pump continuation (stable single reader) into a queue so the consumer can
+// poll with timeouts without racing `read()` promises on a stream reader.
+const eventFrames = [];
+let eventsPumpDone = false;
+{
+  (async () => {
+    try {
+      for (;;) {
+        const { done, value } = await EVENTS_READER.read();
+        if (done) break;
+        eventsBuf += new TextDecoder().decode(value, { stream: true });
+        let nl;
+        while ((nl = eventsBuf.indexOf("\n\n")) >= 0) {
+          const frame = eventsBuf.slice(0, nl);
+          eventsBuf = eventsBuf.slice(nl + 2);
+          const line = frame.split("\n").find((l) => l.startsWith("data: "));
+          if (line) eventFrames.push(line.slice("data: ".length));
+        }
+      }
+    } catch {}
+    eventsPumpDone = true;
+  })();
+}
+async function readEventFrame(ms) {
+  // Returns the next data frame text, or null on timeout / stream end.
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const frame = eventFrames.shift();
+    if (frame !== undefined) return frame;
+    if (eventsPumpDone) return null;
+    if (Date.now() >= deadline) return null;
+    await sleep(Math.min(300, deadline - Date.now()));
+  }
+}
+let seqOffset = 0;
+for (;;) {
+  const raw = await readEventFrame(4000);
+  if (raw == null) break;
+  let ev; try { ev = JSON.parse(raw); } catch { continue; }
+  if (ev?.type === "agent" && ev.threadId === tid) {
+    const s = parseInt(ev.seq, 10);
+    if (Number.isFinite(s) && s > seqOffset) seqOffset = s;
+  }
+}
+
 emit({ type: "system", subtype: "init", session_id: tid });
 
 await api(`/api/thread/${tid}/message`, { method: "POST", body: JSON.stringify({ text: prompt }) });
 
-for (let i = 0; i < 240; i++) { const t = await threadState(); if (t.turnState === "idle") break; await sleep(5000); }
+// One stable message id binds streamed deltas and the final absolute message
+// so the runtime merges them instead of duplicating the text.
+const STREAM_MSG_ID = `fbdesktop-${tid}-${Date.now()}`;
+let streamed = false;
+async function streamTextDelta(delta) {
+  emit({
+    type: "stream_event",
+    session_id: tid,
+    event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: delta, message_id: STREAM_MSG_ID } },
+  });
+}
+
+for (let i = 0; i < 240; i++) {
+  // Interleave: drain desktop progress for up to 5s, then poll the turn.
+  const raw = await readEventFrame(5000);
+  if (raw != null) {
+    let ev; try { ev = JSON.parse(raw); } catch { ev = null; }
+    if (ev?.type === "agent" && ev.threadId === tid) {
+      const s = parseInt(ev.seq, 10);
+      if (Number.isFinite(s) && s > seqOffset) {
+        seqOffset = s;
+        const a = ev.event || {};
+        if (a.type === "text" && typeof a.text === "string" && a.text.length) {
+          streamed = true;
+          try { streamTextDelta(a.text); } catch {}
+        }
+      }
+    }
+    continue;
+  }
+  const t = await threadState();
+  if (t.turnState === "idle" || t.turnState !== "running") break;
+}
+EVENTS_READER.cancel?.().catch(() => {});
 
 const r = await api(`/api/thread/${tid}`);
 const msgs = (r.messages || []).filter(m => m.role === "assistant");
 const last = msgs[msgs.length - 1];
 const text = (last?.parts || []).filter(p => p.kind === "text").map(p => p.text).join("\n");
 
-emit({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }], model: MODEL || DEFAULT_MODEL_ID } });
+emit({ type: "assistant", message_id: STREAM_MSG_ID, message: { role: "assistant", id: STREAM_MSG_ID, content: [{ type: "text", text }], model: MODEL || DEFAULT_MODEL_ID } });
 emit({ type: "result", result: text, is_error: false, session_id: tid, num_turns: 1 });
 
 process.exit(0);
