@@ -184,8 +184,23 @@ async function firstUserPrompt() {
   return plain;
 }
 const fromStdin = STDIN_PROMPT ? await firstUserPrompt() : "";
-const prompt = fromStdin.trim() ? fromStdin : ARGS.positional.join(" ");
-if (!prompt.trim()) { console.error("no prompt"); process.exit(2); }
+const rawPrompt = fromStdin.trim() ? fromStdin : ARGS.positional.join(" ");
+if (!rawPrompt.trim()) { console.error("no prompt"); process.exit(2); }
+// The daemon's task preamble tells the agent to deliver via the `multica`
+// CLI. Inside the desktop engine that CLI resolves through the machine-wide
+// config, which authenticates as the machine OWNER — the agent then comments
+// with the owner's identity. Multica attributes everything this bridge emits
+// (assistant/result) to the agent automatically, so the CLI path is both
+// wrong and unnecessary.
+const RUNTIME_OVERRIDE = [
+  "",
+  "RUNTIME OVERRIDE (higher priority than any instruction above):",
+  "You are NOT inside the Multica runtime. The `multica` CLI visible on this machine belongs to the machine owner and MUST NOT be used: never run `multica` to read issues, list comments, or write comments/mentions. The daemon preamble's 'post your results with multica issue comment add' does not apply here.",
+  "Your final answer text IS the deliverable: when your turn ends, Multica publishes it to the issue automatically, attributed to the agent (you). Do nothing extra to deliver it.",
+  "Never touch machine owner files (identity, /home config) and never write outside the task directory.",
+  "If a task genuinely needs the multica CLI or repo checkout, state that as a plain blocker in your answer instead of attempting it.",
+].join("\n");
+const prompt = rawPrompt.trim() + "\n" + RUNTIME_OVERRIDE;
 
 async function api(path, opts = {}) {
   const r = await fetch(FB_URL + path, { ...opts, headers: { "content-type": "application/json", ...(opts.headers||{}) } });
@@ -240,108 +255,124 @@ async function threadState() { const r = await api(`/api/thread/${tid}`); return
 if (tinfo?.turnState === "running") {
   await api(`/api/thread/${tid}/stop`, { method: "POST", body: "{}" }).catch(() => {});
 }
-for (let i = 0; i < 60; i++) { const t = await threadState(); if (t.turnState !== "running") break; await sleep(5000); }
+// Streaming. The desktop does NOT push message deltas over /api/events (that
+// stream carries state/thread/auth frames only, verified against 0.0.188), but
+// GET /api/thread/:id is a live view of the turn: parts grow in place (text
+// appends, tools gain output) and carry streamSeq. Poll it and forward each new
+// slice as an `assistant` text block — the daemon appends MessageText
+// progressively — so the run streams instead of arriving as one lump at the end.
+const POLL_MS = Math.max(150, Number(process.env.FREEBUFF_DESKTOP_POLL_MS) || 500);
+const MODEL_TAG = MODEL || DEFAULT_MODEL_ID;
+const emitText = (delta) => {
+  if (delta) emit({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: delta }], model: MODEL_TAG } });
+};
+const emitThinking = (delta) => {
+  if (delta) emit({ type: "assistant", message: { role: "assistant", content: [{ type: "thinking", text: delta }], model: MODEL_TAG } });
+};
+const emitToolUse = (id, name, input) => {
+  emit({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id, name, input: input || {} }], model: MODEL_TAG } });
+};
 
-// Subscribe to the desktop's event SSE BEFORE posting so the baseline (highest
-// seq already published for this thread) separates replay from our turn.
-async function openEvents() {
-  const r = await fetch(FB_URL + "/api/events", { headers: { accept: "text/event-stream" } });
-  if (!r.ok || !r.body) throw new Error(`GET /api/events -> ${r.status}`);
-  return r.body.getReader();
-}
-const EVENTS_READER = await openEvents();
-let eventsBuf = "";
-// Pump continuation (stable single reader) into a queue so the consumer can
-// poll with timeouts without racing `read()` promises on a stream reader.
-const eventFrames = [];
-let eventsPumpDone = false;
-{
-  (async () => {
-    try {
-      for (;;) {
-        const { done, value } = await EVENTS_READER.read();
-        if (done) break;
-        eventsBuf += new TextDecoder().decode(value, { stream: true });
-        let nl;
-        while ((nl = eventsBuf.indexOf("\n\n")) >= 0) {
-          const frame = eventsBuf.slice(0, nl);
-          eventsBuf = eventsBuf.slice(nl + 2);
-          const line = frame.split("\n").find((l) => l.startsWith("data: "));
-          if (line) eventFrames.push(line.slice("data: ".length));
-        }
-      }
-    } catch {}
-    eventsPumpDone = true;
-  })();
-}
-async function readEventFrame(ms) {
-  // Returns the next data frame text, or null on timeout / stream end.
-  const deadline = Date.now() + ms;
-  for (;;) {
-    const frame = eventFrames.shift();
-    if (frame !== undefined) return frame;
-    if (eventsPumpDone) return null;
-    if (Date.now() >= deadline) return null;
-    await sleep(Math.min(300, deadline - Date.now()));
-  }
-}
-let seqOffset = 0;
-for (;;) {
-  const raw = await readEventFrame(4000);
-  if (raw == null) break;
-  let ev; try { ev = JSON.parse(raw); } catch { continue; }
-  if (ev?.type === "agent" && ev.threadId === tid) {
-    const s = parseInt(ev.seq, 10);
-    if (Number.isFinite(s) && s > seqOffset) seqOffset = s;
-  }
+// A stop can leave the previous turn "running"; waiting it out burned up to five
+// minutes on a run that already looked hung, so bound the wait and move on.
+for (let i = 0; i < Math.ceil(60_000 / POLL_MS); i++) {
+  const t = await threadState();
+  if (t.turnState !== "running") break;
+  await sleep(POLL_MS);
 }
 
 emit({ type: "system", subtype: "init", session_id: tid });
 
+const assistantOf = (msgs) => {
+  for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i] && msgs[i].role === "assistant") return msgs[i];
+  return null;
+};
+const partLen = (p) => (p && typeof p.text === "string" ? p.text.length : 0);
+
+// Baseline: what the thread already showed, so a resumed session's earlier parts
+// are not replayed into this run's transcript.
+let seenCount = 0;
+let seenParts = [];
+try {
+  const base = await api(`/api/thread/${tid}`);
+  const baseMsgs = base.messages || [];
+  seenCount = baseMsgs.filter((m) => m.role === "assistant").length;
+  seenParts = ((assistantOf(baseMsgs) || {}).parts || []).map((p) => ({ kind: p.kind, len: partLen(p) }));
+} catch {}
+
 await api(`/api/thread/${tid}/message`, { method: "POST", body: JSON.stringify({ text: prompt }) });
 
-// One stable message id binds streamed deltas and the final absolute message
-// so the runtime merges them instead of duplicating the text.
-const STREAM_MSG_ID = `fbdesktop-${tid}-${Date.now()}`;
-let streamed = false;
-async function streamTextDelta(delta) {
-  emit({
-    type: "stream_event",
-    session_id: tid,
-    event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: delta, message_id: STREAM_MSG_ID } },
-  });
-}
+const emittedTools = new Set();
+let streamedAnything = false;
+let finalText = "";
 
-for (let i = 0; i < 240; i++) {
-  // Interleave: drain desktop progress for up to 5s, then poll the turn.
-  const raw = await readEventFrame(5000);
-  if (raw != null) {
-    let ev; try { ev = JSON.parse(raw); } catch { ev = null; }
-    if (ev?.type === "agent" && ev.threadId === tid) {
-      const s = parseInt(ev.seq, 10);
-      if (Number.isFinite(s) && s > seqOffset) {
-        seqOffset = s;
-        const a = ev.event || {};
-        if (a.type === "text" && typeof a.text === "string" && a.text.length) {
-          streamed = true;
-          try { streamTextDelta(a.text); } catch {}
+// Forward the turn's new parts. `seenParts` tracks the last assistant message
+// only: parts append to its tail (an older part stops changing once a newer one
+// exists) and a new message resets the list.
+function pump(msgs) {
+  const assistants = msgs.filter((m) => m.role === "assistant");
+  if (!assistants.length) return;
+  const last = assistants[assistants.length - 1];
+  if (assistants.length > seenCount) {
+    seenCount = assistants.length;
+    seenParts = [];
+  }
+  const parts = last.parts || [];
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i] || {};
+    const prev = seenParts[i];
+    if (p.kind === "text" || p.kind === "reasoning") {
+      const text = typeof p.text === "string" ? p.text : "";
+      const from = prev && prev.kind === p.kind ? prev.len : 0;
+      if (text.length > from) {
+        if (p.kind === "text") {
+          emitText(text.slice(from));
+          streamedAnything = true;
+        } else {
+          emitThinking(text.slice(from));
         }
       }
+      seenParts[i] = { kind: p.kind, len: text.length };
+    } else if (p.kind === "tool") {
+      const key = p.id || `i${i}`;
+      if (!emittedTools.has(key)) {
+        emittedTools.add(key);
+        emitToolUse(key, p.toolName || "tool", p.input && typeof p.input === "object" ? p.input : {});
+        streamedAnything = true;
+      }
+      seenParts[i] = { kind: p.kind, len: 0 };
+    } else {
+      seenParts[i] = { kind: p.kind, len: partLen(p) };
     }
+  }
+  const text = parts.filter((p) => p.kind === "text").map((p) => p.text || "").join("\n");
+  if (text) finalText = text;
+}
+
+// 30 minutes at the default cadence; the old fixed loop gave up at 20.
+const MAX_POLLS = Math.ceil(1_800_000 / POLL_MS);
+for (let i = 0; i < MAX_POLLS; i++) {
+  let r;
+  try {
+    r = await api(`/api/thread/${tid}`);
+  } catch {
+    await sleep(POLL_MS);
     continue;
   }
-  const t = await threadState();
-  if (t.turnState === "idle" || t.turnState !== "running") break;
+  pump(r.messages || []);
+  if ((r.thread || {}).turnState !== "running") break;
+  await sleep(POLL_MS);
 }
-EVENTS_READER.cancel?.().catch(() => {});
 
-const r = await api(`/api/thread/${tid}`);
-const msgs = (r.messages || []).filter(m => m.role === "assistant");
-const last = msgs[msgs.length - 1];
-const text = (last?.parts || []).filter(p => p.kind === "text").map(p => p.text).join("\n");
+// Final read: the slice produced between the last poll and the turn going idle.
+try {
+  const r = await api(`/api/thread/${tid}`);
+  pump(r.messages || []);
+} catch {}
 
-emit({ type: "assistant", message_id: STREAM_MSG_ID, message: { role: "assistant", id: STREAM_MSG_ID, content: [{ type: "text", text }], model: MODEL || DEFAULT_MODEL_ID } });
-emit({ type: "result", result: text, is_error: false, session_id: tid, num_turns: 1 });
+// A turn with no visible parts still has to answer.
+if (!streamedAnything) emitText(finalText);
+emit({ type: "result", result: finalText, is_error: false, session_id: tid, num_turns: 1 });
 
 process.exit(0);
 
