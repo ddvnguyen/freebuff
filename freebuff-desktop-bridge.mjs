@@ -23,9 +23,13 @@ const HOME_DIR = resolve(CREDENTIAL_REF || process.env.FREEBUFF_DESKTOP_STATE_DI
 // it can never leak into the prompt text.
 const FLAGS_WITH_VALUE = new Set([
   "--model", "-m", "--effort", "--output-format", "--input-format", "--max-turns",
-  "--append-system-prompt", "--resume", "--mcp-config", "--permission-mode",
-  "--allowedTools", "--disallowedTools", "--allowed-tools", "--disallowed-tools",
-  "--settings", "--add-dir", "--session-id", "--agent",
+  "--append-system-prompt", "--resume", "--permission-mode",
+  "--settings", "--session-id", "--agent",
+]);
+// Variadic in codebuddy's CLI: they swallow every following non-flag token
+// (the daemon passes `--disallowedTools AskUserQuestion EnterPlanMode ...`).
+const FLAGS_WITH_VARIADIC = new Set([
+  "--allowedTools", "--disallowedTools", "--allowed-tools", "--disallowed-tools", "--add-dir", "--mcp-config",
 ]);
 function parseArgs(argv) {
   const out = { listModels: false, json: false, model: "", positional: [] };
@@ -35,6 +39,7 @@ function parseArgs(argv) {
     else if (a === "--json") out.json = true;
     else if (a === "--model" || a === "-m") out.model = argv[++i] || "";
     else if (a.startsWith("--model=")) out.model = a.slice("--model=".length);
+    else if (FLAGS_WITH_VARIADIC.has(a)) { while (i + 1 < argv.length && !argv[i + 1].startsWith("-")) i++; }
     else if (FLAGS_WITH_VALUE.has(a)) i++;
     else if (a.startsWith("-")) continue;
     else out.positional.push(a);
@@ -42,6 +47,7 @@ function parseArgs(argv) {
   return out;
 }
 const ARGS = parseArgs(process.argv.slice(2));
+const STDIN_PROMPT = process.argv.includes("--input-format") || !process.stdin.isTTY;
 // The one entry the bridge used to advertise; also what "no --model" means.
 const DEFAULT_MODEL_ID = "freebuff-desktop";
 const MODEL = ARGS.model && ARGS.model !== DEFAULT_MODEL_ID ? ARGS.model : "";
@@ -149,7 +155,10 @@ function promptFromStdin(raw) {
   }
   return parts.join("\n");
 }
-const prompt = ARGS.positional.join(" ") || promptFromStdin(await readStdin());
+// Under the daemon the prompt is always on stdin; positionals are only a fallback
+// for hand-run use, so a stray flag value can never replace the real prompt.
+const fromStdin = STDIN_PROMPT ? promptFromStdin(await readStdin()) : "";
+const prompt = fromStdin.trim() ? fromStdin : ARGS.positional.join(" ");
 if (!prompt.trim()) { console.error("no prompt"); process.exit(2); }
 
 async function api(path, opts = {}) {
