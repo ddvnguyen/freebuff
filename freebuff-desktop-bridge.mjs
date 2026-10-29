@@ -35,13 +35,14 @@ const FLAGS_WITH_VARIADIC = new Set([
   "--allowedTools", "--disallowedTools", "--allowed-tools", "--disallowed-tools", "--add-dir", "--mcp-config",
 ]);
 function parseArgs(argv) {
-  const out = { listModels: false, json: false, model: "", positional: [] };
+  const out = { listModels: false, json: false, model: "", resume: "", positional: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--list-models") out.listModels = true;
     else if (a === "--json") out.json = true;
     else if (a === "--model" || a === "-m") out.model = argv[++i] || "";
     else if (a.startsWith("--model=")) out.model = a.slice("--model=".length);
+    else if (a === "--resume") out.resume = argv[++i] || "";
     else if (FLAGS_WITH_VARIADIC.has(a)) { while (i + 1 < argv.length && !argv[i + 1].startsWith("-")) i++; }
     else if (FLAGS_WITH_VALUE.has(a)) i++;
     else if (a.startsWith("-")) continue;
@@ -195,7 +196,25 @@ async function api(path, opts = {}) {
 // One reusable thread per model: a thread's model is fixed when it is created.
 // The default (no --model) keeps the original top-level thread_id.
 state.threads = state.threads || {};
-let tid = MODEL ? state.threads[MODEL] : state.thread_id;
+// Adopt in order: --resume (the daemon resumes the previous run's session after
+// a cancel/requeue), then the state's known thread; create only when neither is
+// usable. Adopting a thread with a still-running turn (the ghost of a cancelled
+// run) stops that turn first — otherwise the new prompt rides on a dead turn
+// and a fresh thread gets charged.
+async function adopt(id) {
+  try {
+    const r = await api(`/api/thread/${id}`);
+    const t = r.thread;
+    if (t && t.status === "open") return t;
+  } catch {}
+  return null;
+}
+let tinfo = null;
+let tid = null;
+for (const id of [ARGS.resume, MODEL ? state.threads[MODEL] : state.thread_id].filter(Boolean)) {
+  tinfo = await adopt(id);
+  if (tinfo) { tid = id; break; }
+}
 if (!tid) {
   let found = null;
   if (!MODEL) {
@@ -204,17 +223,23 @@ if (!tid) {
       if (t.status === "open" && !t.archivedAt && t.turnState === "idle") { found = t.id; break; }
     }
   }
-  if (found) tid = found;
+  if (found) { tid = found; tinfo = await adopt(tid); }
   else {
     const body = { projectPath: HOME_DIR, ...(MODEL ? { harnessId: "codebuff", model: MODEL } : {}) };
     const r = await api("/api/threads", { method: "POST", body: JSON.stringify(body) });
     tid = r.id;
   }
+}
+const known = MODEL ? state.threads[MODEL] : state.thread_id;
+if (known !== tid) {
   if (MODEL) state.threads[MODEL] = tid; else state.thread_id = tid;
   saveState();
 }
 
 async function threadState() { const r = await api(`/api/thread/${tid}`); return r.thread; }
+if (tinfo?.turnState === "running") {
+  await api(`/api/thread/${tid}/stop`, { method: "POST", body: "{}" }).catch(() => {});
+}
 for (let i = 0; i < 60; i++) { const t = await threadState(); if (t.turnState !== "running") break; await sleep(5000); }
 
 emit({ type: "system", subtype: "init", session_id: tid });
