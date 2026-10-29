@@ -6,15 +6,18 @@
 // endpoint, FREEBUFF_DESKTOP_CREDENTIAL_REF points at a daemon-local reference
 // (e.g. a token file / FB_HOME dir) the bridge resolves itself. Credentials
 // never travel through Multica's DB.
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync, renameSync } from "node:fs";
+import { join, resolve, dirname } from "node:path";
 
 const FB_URL = (process.env.FREEBUFF_DESKTOP_URL || process.env.FB_URL || "http://localhost:4320").replace(/\/+$/, "");
+// Per-account state (the reusable thread id) lives beside the installed
+// bridge: Multica hands every run a fresh workdir, so a workdir default would
+// create a new desktop session on every run. FREEBUFF_DESKTOP_STATE_DIR and the
+// account's credential ref (FB_HOME) still win, e.g. for per-account isolation;
+// credentials never travel through Multica's DB. Never a fixed host path.
 const CREDENTIAL_REF = process.env.FREEBUFF_DESKTOP_CREDENTIAL_REF || process.env.FB_HOME || "";
-// Per-account state (the reusable thread id) lives in the directory the
-// credential reference names; without one it lives under the working directory
-// of the run, or FREEBUFF_DESKTOP_STATE_DIR when set. Never a fixed host path.
-const HOME_DIR = resolve(CREDENTIAL_REF || process.env.FREEBUFF_DESKTOP_STATE_DIR || join(process.cwd(), ".freebuff-desktop"));
+const INSTALL_DIR = (process.argv[1] && existsSync(process.argv[1]) ? dirname(realpathSync(process.argv[1])) : process.cwd());
+const HOME_DIR = resolve(CREDENTIAL_REF || process.env.FREEBUFF_DESKTOP_STATE_DIR || join(INSTALL_DIR, ".freebuff-desktop-state"));
 
 // Arguments. The daemon launches this as a codebuddy-family command, so it
 // receives codebuddy's flags (-p --output-format stream-json --input-format
@@ -208,7 +211,7 @@ if (!tid) {
     tid = r.id;
   }
   if (MODEL) state.threads[MODEL] = tid; else state.thread_id = tid;
-  writeFileSync(STATE, JSON.stringify(state));
+  saveState();
 }
 
 async function threadState() { const r = await api(`/api/thread/${tid}`); return r.thread; }
@@ -230,5 +233,11 @@ emit({ type: "result", result: text, is_error: false, session_id: tid, num_turns
 
 process.exit(0);
 
+function saveState(){
+  // Atomic: several runs may share this state dir, a torn write would strand
+  // a reusable thread id behind a JSON parse failure.
+  writeFileSync(STATE + ".tmp", JSON.stringify(state));
+  renameSync(STATE + ".tmp", STATE);
+}
 function emit(o){ process.stdout.write(JSON.stringify(o) + "\n"); }
 function sleep(ms){ return new Promise(res=>setTimeout(res,ms)); }
