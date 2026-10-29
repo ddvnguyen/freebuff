@@ -141,23 +141,45 @@ if (existsSync(STATE)) try { state = JSON.parse(readFileSync(STATE, "utf8")); } 
 // The daemon sends the prompt on stdin as stream-json user messages
 // ({"type":"user","message":{"content":"..."|[{"type":"text","text":"..."}]}});
 // a positional argument or plain text on stdin works too.
-function promptFromStdin(raw) {
-  const parts = [];
-  for (const line of raw.split("\n")) {
-    const t = line.trim();
-    if (!t) continue;
-    let ev;
-    try { ev = JSON.parse(t); } catch { return raw; }
-    if (ev?.type !== "user") continue;
-    const c = ev.message?.content;
-    if (typeof c === "string") parts.push(c);
-    else if (Array.isArray(c)) parts.push(c.filter((p) => p?.type === "text").map((p) => p.text).join("\n"));
-  }
-  return parts.join("\n");
+// Text of a stream-json user event: "content" is a string or a text-parts array.
+function userEventText(ev) {
+  const c = ev.message?.content;
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) return c.filter((p) => p?.type === "text").map((p) => p.text).join("\n");
+  return "";
 }
-// Under the daemon the prompt is always on stdin; positionals are only a fallback
-// for hand-run use, so a stray flag value can never replace the real prompt.
-const fromStdin = STDIN_PROMPT ? promptFromStdin(await readStdin()) : "";
+// The daemon keeps stdin open for steering (more user frames may arrive during
+// the turn), so the prompt is THE FIRST user frame, not stdin-EOF: reading to
+// EOF here deadlocks the run (daemon waits for output, bridge waits for EOF).
+// Plain text only lands via the EOF fallback below, so non-JSON junk never
+// becomes the prompt while a daemon is attached.
+async function firstUserPrompt() {
+  const reader = process.stdin[Symbol.asyncIterator]();
+  let plain = "";
+  try {
+    for (;;) {
+      const { value, done } = await reader.next();
+      if (done) break;
+      let data = value instanceof Uint8Array ? new TextDecoder().decode(value) : value;
+      for (const line of data.split("\n")) {
+        const t = line.trim();
+        if (!t) continue;
+        try {
+          const ev = JSON.parse(t);
+          if (ev?.type === "user") {
+            const text = userEventText(ev);
+            if (text.trim()) return text;
+          }
+        } catch { plain += (plain ? "\n" : "") + line; }
+      }
+    }
+  } finally {
+    // Release stdin; the daemon may keep writing (steering) — ignore it.
+    process.stdin.destroy();
+  }
+  return plain;
+}
+const fromStdin = STDIN_PROMPT ? await firstUserPrompt() : "";
 const prompt = fromStdin.trim() ? fromStdin : ARGS.positional.join(" ");
 if (!prompt.trim()) { console.error("no prompt"); process.exit(2); }
 
@@ -210,4 +232,3 @@ process.exit(0);
 
 function emit(o){ process.stdout.write(JSON.stringify(o) + "\n"); }
 function sleep(ms){ return new Promise(res=>setTimeout(res,ms)); }
-async function readStdin(){ let d=""; for await (const c of process.stdin) d+=c; return d; }
