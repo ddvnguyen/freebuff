@@ -6,15 +6,18 @@
 // endpoint, FREEBUFF_DESKTOP_CREDENTIAL_REF points at a daemon-local reference
 // (e.g. a token file / FB_HOME dir) the bridge resolves itself. Credentials
 // never travel through Multica's DB.
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync, renameSync } from "node:fs";
+import { join, resolve, dirname } from "node:path";
 
 const FB_URL = (process.env.FREEBUFF_DESKTOP_URL || process.env.FB_URL || "http://localhost:4320").replace(/\/+$/, "");
+// Per-account state (the reusable thread id) lives beside the installed
+// bridge: Multica hands every run a fresh workdir, so a workdir default would
+// create a new desktop session on every run. FREEBUFF_DESKTOP_STATE_DIR and the
+// account's credential ref (FB_HOME) still win, e.g. for per-account isolation;
+// credentials never travel through Multica's DB. Never a fixed host path.
 const CREDENTIAL_REF = process.env.FREEBUFF_DESKTOP_CREDENTIAL_REF || process.env.FB_HOME || "";
-// Per-account state (the reusable thread id) lives in the directory the
-// credential reference names; without one it lives under the working directory
-// of the run, or FREEBUFF_DESKTOP_STATE_DIR when set. Never a fixed host path.
-const HOME_DIR = resolve(CREDENTIAL_REF || process.env.FREEBUFF_DESKTOP_STATE_DIR || join(process.cwd(), ".freebuff-desktop"));
+const INSTALL_DIR = (process.argv[1] && existsSync(process.argv[1]) ? dirname(realpathSync(process.argv[1])) : process.cwd());
+const HOME_DIR = resolve(CREDENTIAL_REF || process.env.FREEBUFF_DESKTOP_STATE_DIR || join(INSTALL_DIR, ".freebuff-desktop-state"));
 
 // Arguments. The daemon launches this as a codebuddy-family command, so it
 // receives codebuddy's flags (-p --output-format stream-json --input-format
@@ -32,13 +35,14 @@ const FLAGS_WITH_VARIADIC = new Set([
   "--allowedTools", "--disallowedTools", "--allowed-tools", "--disallowed-tools", "--add-dir", "--mcp-config",
 ]);
 function parseArgs(argv) {
-  const out = { listModels: false, json: false, model: "", positional: [] };
+  const out = { listModels: false, json: false, model: "", resume: "", positional: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--list-models") out.listModels = true;
     else if (a === "--json") out.json = true;
     else if (a === "--model" || a === "-m") out.model = argv[++i] || "";
     else if (a.startsWith("--model=")) out.model = a.slice("--model=".length);
+    else if (a === "--resume") out.resume = argv[++i] || "";
     else if (FLAGS_WITH_VARIADIC.has(a)) { while (i + 1 < argv.length && !argv[i + 1].startsWith("-")) i++; }
     else if (FLAGS_WITH_VALUE.has(a)) i++;
     else if (a.startsWith("-")) continue;
@@ -141,25 +145,89 @@ if (existsSync(STATE)) try { state = JSON.parse(readFileSync(STATE, "utf8")); } 
 // The daemon sends the prompt on stdin as stream-json user messages
 // ({"type":"user","message":{"content":"..."|[{"type":"text","text":"..."}]}});
 // a positional argument or plain text on stdin works too.
-function promptFromStdin(raw) {
-  const parts = [];
-  for (const line of raw.split("\n")) {
-    const t = line.trim();
-    if (!t) continue;
-    let ev;
-    try { ev = JSON.parse(t); } catch { return raw; }
-    if (ev?.type !== "user") continue;
-    const c = ev.message?.content;
-    if (typeof c === "string") parts.push(c);
-    else if (Array.isArray(c)) parts.push(c.filter((p) => p?.type === "text").map((p) => p.text).join("\n"));
-  }
-  return parts.join("\n");
+// Text of a stream-json user event: "content" is a string or a text-parts array.
+function userEventText(ev) {
+  const c = ev.message?.content;
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) return c.filter((p) => p?.type === "text").map((p) => p.text).join("\n");
+  return "";
 }
-// Under the daemon the prompt is always on stdin; positionals are only a fallback
-// for hand-run use, so a stray flag value can never replace the real prompt.
-const fromStdin = STDIN_PROMPT ? promptFromStdin(await readStdin()) : "";
-const prompt = fromStdin.trim() ? fromStdin : ARGS.positional.join(" ");
-if (!prompt.trim()) { console.error("no prompt"); process.exit(2); }
+// The daemon keeps stdin open for steering (more user frames may arrive during
+// the turn), so the prompt is THE FIRST user frame, not stdin-EOF: reading to
+// EOF here deadlocks the run (daemon waits for output, bridge waits for EOF).
+// Plain text only lands via the EOF fallback below, so non-JSON junk never
+// becomes the prompt while a daemon is attached.
+async function firstUserPrompt() {
+  const reader = process.stdin[Symbol.asyncIterator]();
+  let plain = "";
+  try {
+    for (;;) {
+      const { value, done } = await reader.next();
+      if (done) break;
+      let data = value instanceof Uint8Array ? new TextDecoder().decode(value) : value;
+      for (const line of data.split("\n")) {
+        const t = line.trim();
+        if (!t) continue;
+        try {
+          const ev = JSON.parse(t);
+          if (ev?.type === "user") {
+            const text = userEventText(ev);
+            if (text.trim()) return text;
+          }
+        } catch { plain += (plain ? "\n" : "") + line; }
+      }
+    }
+  } finally {
+    // Release stdin; the daemon may keep writing (steering) — ignore it.
+    process.stdin.destroy();
+  }
+  return plain;
+}
+const fromStdin = STDIN_PROMPT ? await firstUserPrompt() : "";
+const rawPrompt = fromStdin.trim() ? fromStdin : ARGS.positional.join(" ");
+if (!rawPrompt.trim()) { console.error("no prompt"); process.exit(2); }
+// The desktop engine runs its shell tools with the DESKTOP SERVICE's environment,
+// not this run's. A bare `multica` there resolves through the machine-wide
+// config and authenticates as the machine OWNER, so the agent would comment as
+// the owner. Instead the bridge writes a per-run shim next to the task files
+// that exports this run's own MULTICA_* environment (the daemon's task-scoped
+// token, agent id, task id) and execs the real CLI: the engine's agent then
+// works as THIS agent, attributed to this run. The token is written to a 0700
+// file in the task directory only; it never enters the prompt.
+function writeMulticaShim() {
+  if (!process.env.MULTICA_TOKEN) return "";
+  let real = "";
+  for (const d of (process.env.PATH || "").split(":")) {
+    const c = join(d, "multica");
+    if (d && existsSync(c)) { real = c; break; }
+  }
+  if (!real) return "";
+  const q = (v) => "'" + String(v).replace(/'/g, "'\\''") + "'";
+  const lines = Object.entries(process.env)
+    .filter(([k]) => k.startsWith("MULTICA_"))
+    .map(([k, v]) => `export ${k}=${q(v)}`);
+  const dir = join(process.cwd(), ".multica-run");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const shim = join(dir, "multica");
+  writeFileSync(shim, ["#!/bin/sh", ...lines, `exec ${q(real)} "$@"`, ""].join("\n"), { mode: 0o700 });
+  return shim;
+}
+const SHIM = writeMulticaShim();
+const RUNTIME_OVERRIDE = SHIM ? [
+  "",
+  "RUNTIME NOTE (applies to the instructions above):",
+  `Run the Multica CLI ONLY as \`${SHIM}\` (same arguments as \`multica\`), from the task directory ${process.cwd()}. It is pre-authenticated as this agent for this task. Never run a bare \`multica\`: on this machine it belongs to the machine owner and would post as them.`,
+  "Never print, read or copy the contents of that shim or of any file under /home config; never write outside the task directory.",
+  "Follow the task instructions (CODEBUDDY.md in the task directory) for how to read the issue and post results, substituting the shim path for `multica`.",
+].join("\n") : [
+  "",
+  "RUNTIME OVERRIDE (higher priority than any instruction above):",
+  "You are NOT inside the Multica runtime. The `multica` CLI visible on this machine belongs to the machine owner and MUST NOT be used: never run `multica` to read issues, list comments, or write comments/mentions.",
+  "Your final answer text IS the deliverable: when your turn ends, Multica publishes it to the issue automatically, attributed to the agent (you).",
+  "Never touch machine owner files (identity, /home config) and never write outside the task directory.",
+  "If a task genuinely needs the multica CLI or repo checkout, state that as a plain blocker in your answer instead of attempting it.",
+].join("\n");
+const prompt = rawPrompt.trim() + "\n" + RUNTIME_OVERRIDE;
 
 async function api(path, opts = {}) {
   const r = await fetch(FB_URL + path, { ...opts, headers: { "content-type": "application/json", ...(opts.headers||{}) } });
@@ -170,7 +238,25 @@ async function api(path, opts = {}) {
 // One reusable thread per model: a thread's model is fixed when it is created.
 // The default (no --model) keeps the original top-level thread_id.
 state.threads = state.threads || {};
-let tid = MODEL ? state.threads[MODEL] : state.thread_id;
+// Adopt in order: --resume (the daemon resumes the previous run's session after
+// a cancel/requeue), then the state's known thread; create only when neither is
+// usable. Adopting a thread with a still-running turn (the ghost of a cancelled
+// run) stops that turn first — otherwise the new prompt rides on a dead turn
+// and a fresh thread gets charged.
+async function adopt(id) {
+  try {
+    const r = await api(`/api/thread/${id}`);
+    const t = r.thread;
+    if (t && t.status === "open") return t;
+  } catch {}
+  return null;
+}
+let tinfo = null;
+let tid = null;
+for (const id of [ARGS.resume, MODEL ? state.threads[MODEL] : state.thread_id].filter(Boolean)) {
+  tinfo = await adopt(id);
+  if (tinfo) { tid = id; break; }
+}
 if (!tid) {
   let found = null;
   if (!MODEL) {
@@ -179,35 +265,167 @@ if (!tid) {
       if (t.status === "open" && !t.archivedAt && t.turnState === "idle") { found = t.id; break; }
     }
   }
-  if (found) tid = found;
+  if (found) { tid = found; tinfo = await adopt(tid); }
   else {
     const body = { projectPath: HOME_DIR, ...(MODEL ? { harnessId: "codebuff", model: MODEL } : {}) };
     const r = await api("/api/threads", { method: "POST", body: JSON.stringify(body) });
     tid = r.id;
   }
+}
+const known = MODEL ? state.threads[MODEL] : state.thread_id;
+if (known !== tid) {
   if (MODEL) state.threads[MODEL] = tid; else state.thread_id = tid;
-  writeFileSync(STATE, JSON.stringify(state));
+  saveState();
 }
 
 async function threadState() { const r = await api(`/api/thread/${tid}`); return r.thread; }
-for (let i = 0; i < 60; i++) { const t = await threadState(); if (t.turnState !== "running") break; await sleep(5000); }
+if (tinfo?.turnState === "running") {
+  await api(`/api/thread/${tid}/stop`, { method: "POST", body: "{}" }).catch(() => {});
+}
+// Streaming. The desktop does NOT push message deltas over /api/events (that
+// stream carries state/thread/auth frames only, verified against 0.0.188), but
+// GET /api/thread/:id is a live view of the turn: parts grow in place (text
+// appends, tools gain output) and carry streamSeq. Poll it and forward each new
+// slice as an `assistant` text block — the daemon appends MessageText
+// progressively — so the run streams instead of arriving as one lump at the end.
+const POLL_MS = Math.max(150, Number(process.env.FREEBUFF_DESKTOP_POLL_MS) || 500);
+const MODEL_TAG = MODEL || DEFAULT_MODEL_ID;
+const emitText = (delta) => {
+  if (delta) emit({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: delta }], model: MODEL_TAG } });
+};
+const emitThinking = (delta) => {
+  if (delta) emit({ type: "assistant", message: { role: "assistant", content: [{ type: "thinking", text: delta }], model: MODEL_TAG } });
+};
+const emitToolResult = (id, output, isError) => {
+  emit({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: output, is_error: !!isError }] } });
+};
+const emitToolUse = (id, name, input) => {
+  emit({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id, name, input: input || {} }], model: MODEL_TAG } });
+};
+
+// A stop can leave the previous turn "running"; waiting it out burned up to five
+// minutes on a run that already looked hung, so bound the wait and move on.
+for (let i = 0; i < Math.ceil(60_000 / POLL_MS); i++) {
+  const t = await threadState();
+  if (t.turnState !== "running") break;
+  await sleep(POLL_MS);
+}
 
 emit({ type: "system", subtype: "init", session_id: tid });
 
+const assistantOf = (msgs) => {
+  for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i] && msgs[i].role === "assistant") return msgs[i];
+  return null;
+};
+const partLen = (p) => (p && typeof p.text === "string" ? p.text.length : 0);
+
+// Baseline: what the thread already showed, so a resumed session's earlier parts
+// are not replayed into this run's transcript.
+let seenCount = 0;
+let seenParts = [];
+try {
+  const base = await api(`/api/thread/${tid}`);
+  const baseMsgs = base.messages || [];
+  seenCount = baseMsgs.filter((m) => m.role === "assistant").length;
+  seenParts = ((assistantOf(baseMsgs) || {}).parts || []).map((p) => ({ kind: p.kind, len: partLen(p) }));
+} catch {}
+
 await api(`/api/thread/${tid}/message`, { method: "POST", body: JSON.stringify({ text: prompt }) });
 
-for (let i = 0; i < 240; i++) { const t = await threadState(); if (t.turnState === "idle") break; await sleep(5000); }
+const emittedTools = new Set();
+const resultedTools = new Set();
+let streamedAnything = false;
+let finalText = "";
 
-const r = await api(`/api/thread/${tid}`);
-const msgs = (r.messages || []).filter(m => m.role === "assistant");
-const last = msgs[msgs.length - 1];
-const text = (last?.parts || []).filter(p => p.kind === "text").map(p => p.text).join("\n");
+// Forward the turn's new parts. `seenParts` tracks the last assistant message
+// only: parts append to its tail (an older part stops changing once a newer one
+// exists) and a new message resets the list.
+function pump(msgs, final = false) {
+  const assistants = msgs.filter((m) => m.role === "assistant");
+  if (!assistants.length) return;
+  const last = assistants[assistants.length - 1];
+  if (assistants.length > seenCount) {
+    seenCount = assistants.length;
+    seenParts = [];
+  }
+  const parts = last.parts || [];
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i] || {};
+    const prev = seenParts[i];
+    if (p.kind === "text" || p.kind === "reasoning") {
+      const text = typeof p.text === "string" ? p.text : "";
+      const from = prev && prev.kind === p.kind ? prev.len : 0;
+      if (text.length > from) {
+        if (p.kind === "text") {
+          emitText(text.slice(from));
+          streamedAnything = true;
+        } else {
+          emitThinking(text.slice(from));
+        }
+      }
+      seenParts[i] = { kind: p.kind, len: text.length };
+    } else if (p.kind === "tool") {
+      const key = p.id || `i${i}`;
+      if (!emittedTools.has(key)) {
+        emittedTools.add(key);
+        emitToolUse(key, p.toolName || "tool", p.input && typeof p.input === "object" ? p.input : {});
+        streamedAnything = true;
+      }
+      // Without a tool_result the run view keeps the step spinning forever. The
+      // engine marks finished tools with status/output; tools that carry neither
+      // (list_directory, read_files, ...) are closed once a later part exists
+      // or the turn ends (`final`).
+      if (!resultedTools.has(key)) {
+        const done = typeof p.status === "string" && p.status !== "running" && p.status !== "pending";
+        const superseded = final || i < parts.length - 1;
+        if (done || p.output !== undefined || superseded) {
+          resultedTools.add(key);
+          const out = typeof p.output === "string" ? p.output : p.output === undefined ? "" : JSON.stringify(p.output);
+          const failed = (typeof p.status === "string" && p.status !== "success" && p.status !== "completed" && p.status !== "") || (typeof p.exitCode === "number" && p.exitCode !== 0);
+          emitToolResult(key, out, failed);
+        }
+      }
+      seenParts[i] = { kind: p.kind, len: 0 };
+    } else {
+      seenParts[i] = { kind: p.kind, len: partLen(p) };
+    }
+  }
+  const text = parts.filter((p) => p.kind === "text").map((p) => p.text || "").join("\n");
+  if (text) finalText = text;
+}
 
-emit({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }], model: MODEL || DEFAULT_MODEL_ID } });
-emit({ type: "result", result: text, is_error: false, session_id: tid, num_turns: 1 });
+// 30 minutes at the default cadence; the old fixed loop gave up at 20.
+const MAX_POLLS = Math.ceil(1_800_000 / POLL_MS);
+for (let i = 0; i < MAX_POLLS; i++) {
+  let r;
+  try {
+    r = await api(`/api/thread/${tid}`);
+  } catch {
+    await sleep(POLL_MS);
+    continue;
+  }
+  pump(r.messages || []);
+  if ((r.thread || {}).turnState !== "running") break;
+  await sleep(POLL_MS);
+}
+
+// Final read: the slice produced between the last poll and the turn going idle.
+try {
+  const r = await api(`/api/thread/${tid}`);
+  pump(r.messages || [], true);
+} catch {}
+
+// A turn with no visible parts still has to answer.
+if (!streamedAnything) emitText(finalText);
+emit({ type: "result", result: finalText, is_error: false, session_id: tid, num_turns: 1 });
 
 process.exit(0);
 
+function saveState(){
+  // Atomic: several runs may share this state dir, a torn write would strand
+  // a reusable thread id behind a JSON parse failure.
+  writeFileSync(STATE + ".tmp", JSON.stringify(state));
+  renameSync(STATE + ".tmp", STATE);
+}
 function emit(o){ process.stdout.write(JSON.stringify(o) + "\n"); }
 function sleep(ms){ return new Promise(res=>setTimeout(res,ms)); }
-async function readStdin(){ let d=""; for await (const c of process.stdin) d+=c; return d; }
