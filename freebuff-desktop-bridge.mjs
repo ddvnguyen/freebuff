@@ -186,17 +186,44 @@ async function firstUserPrompt() {
 const fromStdin = STDIN_PROMPT ? await firstUserPrompt() : "";
 const rawPrompt = fromStdin.trim() ? fromStdin : ARGS.positional.join(" ");
 if (!rawPrompt.trim()) { console.error("no prompt"); process.exit(2); }
-// The daemon's task preamble tells the agent to deliver via the `multica`
-// CLI. Inside the desktop engine that CLI resolves through the machine-wide
-// config, which authenticates as the machine OWNER — the agent then comments
-// with the owner's identity. Multica attributes everything this bridge emits
-// (assistant/result) to the agent automatically, so the CLI path is both
-// wrong and unnecessary.
-const RUNTIME_OVERRIDE = [
+// The desktop engine runs its shell tools with the DESKTOP SERVICE's environment,
+// not this run's. A bare `multica` there resolves through the machine-wide
+// config and authenticates as the machine OWNER, so the agent would comment as
+// the owner. Instead the bridge writes a per-run shim next to the task files
+// that exports this run's own MULTICA_* environment (the daemon's task-scoped
+// token, agent id, task id) and execs the real CLI: the engine's agent then
+// works as THIS agent, attributed to this run. The token is written to a 0700
+// file in the task directory only; it never enters the prompt.
+function writeMulticaShim() {
+  if (!process.env.MULTICA_TOKEN) return "";
+  let real = "";
+  for (const d of (process.env.PATH || "").split(":")) {
+    const c = join(d, "multica");
+    if (d && existsSync(c)) { real = c; break; }
+  }
+  if (!real) return "";
+  const q = (v) => "'" + String(v).replace(/'/g, "'\\''") + "'";
+  const lines = Object.entries(process.env)
+    .filter(([k]) => k.startsWith("MULTICA_"))
+    .map(([k, v]) => `export ${k}=${q(v)}`);
+  const dir = join(process.cwd(), ".multica-run");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const shim = join(dir, "multica");
+  writeFileSync(shim, ["#!/bin/sh", ...lines, `exec ${q(real)} "$@"`, ""].join("\n"), { mode: 0o700 });
+  return shim;
+}
+const SHIM = writeMulticaShim();
+const RUNTIME_OVERRIDE = SHIM ? [
+  "",
+  "RUNTIME NOTE (applies to the instructions above):",
+  `Run the Multica CLI ONLY as \`${SHIM}\` (same arguments as \`multica\`), from the task directory ${process.cwd()}. It is pre-authenticated as this agent for this task. Never run a bare \`multica\`: on this machine it belongs to the machine owner and would post as them.`,
+  "Never print, read or copy the contents of that shim or of any file under /home config; never write outside the task directory.",
+  "Follow the task instructions (CODEBUDDY.md in the task directory) for how to read the issue and post results, substituting the shim path for `multica`.",
+].join("\n") : [
   "",
   "RUNTIME OVERRIDE (higher priority than any instruction above):",
-  "You are NOT inside the Multica runtime. The `multica` CLI visible on this machine belongs to the machine owner and MUST NOT be used: never run `multica` to read issues, list comments, or write comments/mentions. The daemon preamble's 'post your results with multica issue comment add' does not apply here.",
-  "Your final answer text IS the deliverable: when your turn ends, Multica publishes it to the issue automatically, attributed to the agent (you). Do nothing extra to deliver it.",
+  "You are NOT inside the Multica runtime. The `multica` CLI visible on this machine belongs to the machine owner and MUST NOT be used: never run `multica` to read issues, list comments, or write comments/mentions.",
+  "Your final answer text IS the deliverable: when your turn ends, Multica publishes it to the issue automatically, attributed to the agent (you).",
   "Never touch machine owner files (identity, /home config) and never write outside the task directory.",
   "If a task genuinely needs the multica CLI or repo checkout, state that as a plain blocker in your answer instead of attempting it.",
 ].join("\n");
@@ -269,6 +296,9 @@ const emitText = (delta) => {
 const emitThinking = (delta) => {
   if (delta) emit({ type: "assistant", message: { role: "assistant", content: [{ type: "thinking", text: delta }], model: MODEL_TAG } });
 };
+const emitToolResult = (id, output, isError) => {
+  emit({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: output, is_error: !!isError }] } });
+};
 const emitToolUse = (id, name, input) => {
   emit({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id, name, input: input || {} }], model: MODEL_TAG } });
 };
@@ -303,13 +333,14 @@ try {
 await api(`/api/thread/${tid}/message`, { method: "POST", body: JSON.stringify({ text: prompt }) });
 
 const emittedTools = new Set();
+const resultedTools = new Set();
 let streamedAnything = false;
 let finalText = "";
 
 // Forward the turn's new parts. `seenParts` tracks the last assistant message
 // only: parts append to its tail (an older part stops changing once a newer one
 // exists) and a new message resets the list.
-function pump(msgs) {
+function pump(msgs, final = false) {
   const assistants = msgs.filter((m) => m.role === "assistant");
   if (!assistants.length) return;
   const last = assistants[assistants.length - 1];
@@ -340,6 +371,20 @@ function pump(msgs) {
         emitToolUse(key, p.toolName || "tool", p.input && typeof p.input === "object" ? p.input : {});
         streamedAnything = true;
       }
+      // Without a tool_result the run view keeps the step spinning forever. The
+      // engine marks finished tools with status/output; tools that carry neither
+      // (list_directory, read_files, ...) are closed once a later part exists
+      // or the turn ends (`final`).
+      if (!resultedTools.has(key)) {
+        const done = typeof p.status === "string" && p.status !== "running" && p.status !== "pending";
+        const superseded = final || i < parts.length - 1;
+        if (done || p.output !== undefined || superseded) {
+          resultedTools.add(key);
+          const out = typeof p.output === "string" ? p.output : p.output === undefined ? "" : JSON.stringify(p.output);
+          const failed = (typeof p.status === "string" && p.status !== "success" && p.status !== "completed" && p.status !== "") || (typeof p.exitCode === "number" && p.exitCode !== 0);
+          emitToolResult(key, out, failed);
+        }
+      }
       seenParts[i] = { kind: p.kind, len: 0 };
     } else {
       seenParts[i] = { kind: p.kind, len: partLen(p) };
@@ -367,7 +412,7 @@ for (let i = 0; i < MAX_POLLS; i++) {
 // Final read: the slice produced between the last poll and the turn going idle.
 try {
   const r = await api(`/api/thread/${tid}`);
-  pump(r.messages || []);
+  pump(r.messages || [], true);
 } catch {}
 
 // A turn with no visible parts still has to answer.
