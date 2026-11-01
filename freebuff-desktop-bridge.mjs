@@ -52,6 +52,7 @@ function parseArgs(argv) {
 }
 const ARGS = parseArgs(process.argv.slice(2));
 const STDIN_PROMPT = process.argv.includes("--input-format") || !process.stdin.isTTY;
+const THREAD_MAX_AGE_MS = 4 * 60 * 60 * 1000;
 // The one entry the bridge used to advertise; also what "no --model" means.
 const DEFAULT_MODEL_ID = "freebuff-desktop";
 const MODEL = ARGS.model && ARGS.model !== DEFAULT_MODEL_ID ? ARGS.model : "";
@@ -227,7 +228,7 @@ const RUNTIME_OVERRIDE = SHIM ? [
   "Never touch machine owner files (identity, /home config) and never write outside the task directory.",
   "If a task genuinely needs the multica CLI or repo checkout, state that as a plain blocker in your answer instead of attempting it.",
 ].join("\n");
-const prompt = rawPrompt.trim() + "\n" + RUNTIME_OVERRIDE;
+let prompt = rawPrompt.trim() + "\n" + RUNTIME_OVERRIDE;
 
 async function api(path, opts = {}) {
   const r = await fetch(FB_URL + path, { ...opts, headers: { "content-type": "application/json", ...(opts.headers||{}) } });
@@ -238,39 +239,44 @@ async function api(path, opts = {}) {
 // One reusable thread per model: a thread's model is fixed when it is created.
 // The default (no --model) keeps the original top-level thread_id.
 state.threads = state.threads || {};
-// Adopt in order: --resume (the daemon resumes the previous run's session after
-// a cancel/requeue), then the state's known thread; create only when neither is
-// usable. Adopting a thread with a still-running turn (the ghost of a cancelled
-// run) stops that turn first — otherwise the new prompt rides on a dead turn
-// and a fresh thread gets charged.
+// Adopt only threads explicitly owned by this account's state or requested by
+// the daemon, and only while they are younger than the rotation window. A
+// project-wide idle-thread scan can cross task/project boundaries and would
+// re-adopt expired conversations, so missing or stale state always starts a
+// fresh thread.
 async function adopt(id) {
   try {
     const r = await api(`/api/thread/${id}`);
     const t = r.thread;
-    if (t && t.status === "open") return t;
+    const createdAt = Date.parse(t?.createdAt || t?.created_at || "");
+    const age = Date.now() - createdAt;
+    if (t && t.status === "open" && !t.archivedAt && Number.isFinite(createdAt) && age >= 0 && age < THREAD_MAX_AGE_MS) return t;
   } catch {}
   return null;
 }
 let tinfo = null;
 let tid = null;
+let createdThread = false;
 for (const id of [ARGS.resume, MODEL ? state.threads[MODEL] : state.thread_id].filter(Boolean)) {
   tinfo = await adopt(id);
   if (tinfo) { tid = id; break; }
 }
 if (!tid) {
-  let found = null;
-  if (!MODEL) {
-    const projects = await api("/api/projects");
-    for (const p of projects.projects || []) for (const t of p.threads || []) {
-      if (t.status === "open" && !t.archivedAt && t.turnState === "idle") { found = t.id; break; }
+  const body = { projectPath: HOME_DIR, ...(MODEL ? { harnessId: "codebuff", model: MODEL } : {}) };
+  const r = await api("/api/threads", { method: "POST", body: JSON.stringify(body) });
+  tid = r.id;
+  createdThread = true;
+}
+if (createdThread) {
+  // The bridge owns thread creation/rotation, so it also owns creation-time
+  // task context. This covers expired/invalid --resume IDs without duplicating
+  // the full context on ordinary resumes.
+  try {
+    const context = readFileSync(join(process.cwd(), "CODEBUDDY.md"), "utf8").trim();
+    if (context && !rawPrompt.includes(context)) {
+      prompt = "Context for this task (from CODEBUDDY.md). Follow the task-scoped runtime instructions below.\n\n" + context + "\n\n---\n\n" + prompt;
     }
-  }
-  if (found) { tid = found; tinfo = await adopt(tid); }
-  else {
-    const body = { projectPath: HOME_DIR, ...(MODEL ? { harnessId: "codebuff", model: MODEL } : {}) };
-    const r = await api("/api/threads", { method: "POST", body: JSON.stringify(body) });
-    tid = r.id;
-  }
+  } catch {}
 }
 const known = MODEL ? state.threads[MODEL] : state.thread_id;
 if (known !== tid) {
