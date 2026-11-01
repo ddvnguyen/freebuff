@@ -10,6 +10,8 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync, renam
 import { join, resolve, dirname } from "node:path";
 
 const FB_URL = (process.env.FREEBUFF_DESKTOP_URL || process.env.FB_URL || "http://localhost:4320").replace(/\/+$/, "");
+const LAUNCH_ID = process.env.FREEBUFF_DESKTOP_LAUNCH_ID || "";
+const LAUNCH_HEADERS = LAUNCH_ID ? { "x-freebuff-launch-id": LAUNCH_ID } : {};
 // Per-account state (the reusable thread id) lives beside the installed
 // bridge: Multica hands every run a fresh workdir, so a workdir default would
 // create a new desktop session on every run. FREEBUFF_DESKTOP_STATE_DIR and the
@@ -64,7 +66,7 @@ async function fetchModelCatalog() {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 10000);
   try {
-    const r = await fetch(FB_URL + "/api/events", { signal: ctl.signal, headers: { accept: "text/event-stream" } });
+    const r = await fetch(FB_URL + "/api/events", { signal: ctl.signal, headers: { ...LAUNCH_HEADERS, accept: "text/event-stream" } });
     if (!r.ok || !r.body) throw new Error(`GET /api/events -> ${r.status}`);
     const reader = r.body.getReader();
     const dec = new TextDecoder();
@@ -100,7 +102,7 @@ async function fetchModelCatalog() {
 if (ARGS.listModels) {
   let status;
   try {
-    const r = await fetch(FB_URL + "/api/auth/status", { signal: AbortSignal.timeout(10000) });
+    const r = await fetch(FB_URL + "/api/auth/status", { signal: AbortSignal.timeout(10000), headers: LAUNCH_HEADERS });
     if (!r.ok) throw new Error(`GET /api/auth/status -> ${r.status}`);
     status = await r.json();
   } catch (e) {
@@ -139,7 +141,7 @@ if (ARGS.listModels) {
 }
 
 mkdirSync(HOME_DIR, { recursive: true });
-const STATE = join(HOME_DIR, "state.json");
+const STATE = join(HOME_DIR, "bridge-state.json");
 let state = {};
 if (existsSync(STATE)) try { state = JSON.parse(readFileSync(STATE, "utf8")); } catch {}
 
@@ -231,7 +233,7 @@ const RUNTIME_OVERRIDE = SHIM ? [
 let prompt = rawPrompt.trim() + "\n" + RUNTIME_OVERRIDE;
 
 async function api(path, opts = {}) {
-  const r = await fetch(FB_URL + path, { ...opts, headers: { "content-type": "application/json", ...(opts.headers||{}) } });
+  const r = await fetch(FB_URL + path, { ...opts, headers: { "content-type": "application/json", ...(opts.headers||{}), ...LAUNCH_HEADERS } });
   if (!r.ok) throw new Error(`${opts.method||"GET"} ${path} -> ${r.status}`);
   return r.json();
 }
