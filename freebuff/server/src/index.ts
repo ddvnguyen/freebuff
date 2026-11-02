@@ -23,6 +23,7 @@ Environment:
   FREEBUFF_WEB_NO_AUTH         Set to 1 to disable the password gate (trusted networks only)
   FREEBUFF_WEB_CONFIG_DIR      Where config, profile and logs live (default ~/.config/freebuff-web)
   FREEBUFF_WEB_PROFILE         Orchestrator profile path (default <config dir>/state.json)
+  FREEBUFF_WEB_REGISTRY        Daemon registry path; off disables account switching
   FREEBUFF_WEB_TLS_CERT        PEM certificate for HTTPS (must be paired with FREEBUFF_WEB_TLS_KEY)
   FREEBUFF_WEB_TLS_KEY         PEM private key for HTTPS
   FREEBUFF_APP_PATH            Freebuff Desktop app bundle or its Resources directory
@@ -168,6 +169,15 @@ async function main(): Promise<void> {
       hostname: config.hostname,
       port: config.port,
       orchestratorPort: orchestrator.port,
+      registryPath:
+        process.env.FREEBUFF_WEB_REGISTRY === 'off'
+          ? null
+          : process.env.FREEBUFF_WEB_REGISTRY ||
+            path.join(
+              process.env.FREEBUFF_PROFILES_DIR ||
+                '/mnt/workspace/freebuff-profiles',
+              'registry.json',
+            ),
       auth,
       secureCookie: !!tls,
       tls,
