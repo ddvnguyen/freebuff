@@ -445,6 +445,19 @@ async function proxyHttp(
       )
       continue
     }
+    if (options.launchId && lower === 'content-security-policy') {
+      let policy = value
+      for (const scheme of ['http', 'ws']) {
+        for (const host of ['127.0.0.1', 'localhost']) {
+          policy = policy.replaceAll(
+            `${scheme}://${host}:${options.orchestratorPort}`,
+            '',
+          )
+        }
+      }
+      responseHeaders.set(key, policy)
+      continue
+    }
     responseHeaders.set(key, value)
   }
   for (const cookie of setCookies ?? []) {

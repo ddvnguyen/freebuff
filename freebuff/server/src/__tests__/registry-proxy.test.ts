@@ -31,6 +31,13 @@ beforeAll(async () => {
         })
       if (req.headers.get('x-freebuff-launch-id') !== launch)
         return new Response('denied', { status: 401 })
+      if (url.pathname === '/')
+        return new Response('<html><body><main>app</main></body></html>', {
+          headers: {
+            'content-type': 'text/html',
+            'content-security-policy': `connect-src 'self' http://127.0.0.1:${server.port} ws://127.0.0.1:${server.port}`,
+          },
+        })
       if (url.pathname === '/ws') {
         if (server.upgrade(req, { data: undefined })) return
         return new Response('failed', { status: 400 })
@@ -45,7 +52,14 @@ beforeAll(async () => {
           { headers: { 'content-type': 'text/event-stream' } },
         )
       }
-      return Response.json({ account: 'managed' })
+      return Response.json(
+        { account: 'managed' },
+        {
+          headers: {
+            'content-security-policy': `connect-src 'self' http://127.0.0.1:${server.port} ws://127.0.0.1:${server.port}`,
+          },
+        },
+      )
     },
     websocket: {
       message(ws, message) {
@@ -135,6 +149,16 @@ test('selector routes authenticated HTTP and fails closed for stale identity', a
     },
   })
   expect(await response.json()).toEqual({ account: 'managed' })
+  expect(response.headers.get('content-security-policy')).not.toContain(
+    String(upstream.port),
+  )
+  const document = await fetch(`${base}/`, {
+    headers: { cookie: `${session}; ${selection}` },
+  })
+  const documentText = await document.text()
+  expect(documentText).toContain('Account: Account One')
+  expect(documentText).not.toContain(launch)
+  expect(documentText).not.toContain(String(upstream.port))
   const health = await fetch(`${base}/healthz`, {
     headers: { cookie: `${session}; ${selection}` },
   })
