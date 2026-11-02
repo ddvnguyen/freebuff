@@ -164,6 +164,23 @@ test('selector routes authenticated HTTP and fails closed for stale identity', a
     headers: { cookie: `${session}; ${selection}` },
   })
   expect(stale.status).toBe(503)
+  writeFileSync(
+    path,
+    JSON.stringify([
+      {
+        accountId: 'a1',
+        runtimeId: 'rt',
+        label: 'Account One',
+        port: upstream.port,
+        pid: 42,
+        launchId: 'ffffffffffffffffffffffffffffffff',
+      },
+    ]),
+  )
+  const wrongLaunch = await fetch(`${base}/api/data`, {
+    headers: { cookie: `${session}; ${selection}` },
+  })
+  expect(wrongLaunch.status).toBe(503)
 })
 
 test('switching selects a distinct account without forwarding the selector cookie', async () => {
