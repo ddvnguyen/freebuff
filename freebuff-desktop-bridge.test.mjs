@@ -169,7 +169,8 @@ test("account bridge caches stay isolated", async () => {
   await runBridge({ url: api.url, stateDir: accountA, cwd });
   expect(api.threads.get("new-1").lastPrompt).toContain("Your final answer text IS the deliverable");
   expect(api.threads.get("new-1").lastPrompt.replaceAll(/`[^`]*`/g, "")).not.toMatch(/\b(?:agent|worker)s?\b/i);
-  await runBridge({ url: api.url, stateDir: accountB, cwd });
+  await runBridge({ url: api.url, stateDir: accountB, cwd, prompt: "Preserve agent and worker as user text" });
+  expect(api.threads.get("new-2").lastPrompt).toContain("Preserve agent and worker as user text");
   const stateA = JSON.parse(readFileSync(join(accountA, "bridge-state.json"), "utf8"));
   const stateB = JSON.parse(readFileSync(join(accountB, "bridge-state.json"), "utf8"));
   expect(stateA.thread_id).toBe("new-1");
