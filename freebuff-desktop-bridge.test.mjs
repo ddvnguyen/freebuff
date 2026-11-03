@@ -94,6 +94,15 @@ test("a running turn at the deadline fails instead of reporting success", async 
   expect(api.requests.some((r) => r.path.endsWith("/stop"))).toBe(false);
 });
 
+test("an already running thread is never stopped or sent a new prompt", async () => {
+  const dir = mkdtempSync(join(scratchRoot, "freebuff-bridge-busy-"));
+  scratchDirs.push(dir);
+  const api = await fixtureServer();
+  api.threads.set("human-thread", { id: "human-thread", status: "open", turnState: "running", createdAt: new Date().toISOString(), messages: [] });
+  await expect(runBridge({ url: api.url, stateDir: dir, cwd: dir, resume: "human-thread" })).rejects.toThrow("turn ownership is unknown");
+  expect(api.requests.some((r) => r.path.endsWith("/stop") || r.path.endsWith("/message"))).toBe(false);
+});
+
 test("fresh and resumed threads reference project instructions without copying them into the prompt", async () => {
   const dir = mkdtempSync(join(scratchRoot, "freebuff-bridge-test-"));
   scratchDirs.push(dir);

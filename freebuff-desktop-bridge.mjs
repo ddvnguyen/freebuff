@@ -269,15 +269,14 @@ if (!tid) {
   const r = await api("/api/threads", { method: "POST", body: JSON.stringify(body) });
   tid = r.id;
 }
+if (tinfo?.turnState === "running") {
+  console.error("Freebuff Desktop thread is already running; its turn ownership is unknown.");
+  process.exit(1);
+}
 const known = MODEL ? state.threads[MODEL] : state.thread_id;
 if (known !== tid) {
   if (MODEL) state.threads[MODEL] = tid; else state.thread_id = tid;
   saveState();
-}
-
-async function threadState() { const r = await api(`/api/thread/${tid}`); return r.thread; }
-if (tinfo?.turnState === "running") {
-  await api(`/api/thread/${tid}/stop`, { method: "POST", body: "{}" }).catch(() => {});
 }
 // Streaming. The desktop does NOT push message deltas over /api/events (that
 // stream carries state/thread/auth frames only, verified against 0.0.188), but
@@ -299,14 +298,6 @@ const emitToolResult = (id, output, isError) => {
 const emitToolUse = (id, name, input) => {
   emit({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id, name, input: input || {} }], model: MODEL_TAG } });
 };
-
-// A stop can leave the previous turn "running"; waiting it out burned up to five
-// minutes on a run that already looked hung, so bound the wait and move on.
-for (let i = 0; i < Math.ceil(60_000 / POLL_MS); i++) {
-  const t = await threadState();
-  if (t.turnState !== "running") break;
-  await sleep(POLL_MS);
-}
 
 emit({ type: "system", subtype: "init", session_id: tid });
 
