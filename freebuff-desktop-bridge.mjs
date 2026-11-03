@@ -219,14 +219,15 @@ const SHIM = writeMulticaShim();
 const RUNTIME_OVERRIDE = SHIM ? [
   "",
   "RUNTIME NOTE (applies to the instructions above):",
-  `Run the Multica CLI ONLY as \`${SHIM}\` (same arguments as \`multica\`), from the task directory ${process.cwd()}. It is pre-authenticated as this agent for this task. Never run a bare \`multica\`: on this machine it belongs to the machine owner and would post as them.`,
+  `Use \`${SHIM}\` as the Multica CLI from ${process.cwd()}. It uses this task's identity; a bare \`multica\` uses the machine owner's identity and must not be used.`,
+  `To read the assigned issue, use \`${SHIM} issue get <issue-id> --output json\`; use \`${SHIM} issue comment list <issue-id> --roots-only --summary --output json\` to find relevant discussions.`,
   "Never print, read or copy the contents of that shim or of any file under /home config; never write outside the task directory.",
   "Follow the task instructions (CODEBUDDY.md in the task directory) for how to read the issue and post results, substituting the shim path for `multica`.",
 ].join("\n") : [
   "",
   "RUNTIME OVERRIDE (higher priority than any instruction above):",
   "You are NOT inside the Multica runtime. The `multica` CLI visible on this machine belongs to the machine owner and MUST NOT be used: never run `multica` to read issues, list comments, or write comments/mentions.",
-  "Your final answer text IS the deliverable: when your turn ends, Multica publishes it to the issue automatically, attributed to the agent (you).",
+  "Your final answer text IS the deliverable: when your turn ends, Multica publishes it to the issue automatically under your task identity.",
   "Never touch machine owner files (identity, /home config) and never write outside the task directory.",
   "If a task genuinely needs the multica CLI or repo checkout, state that as a plain blocker in your answer instead of attempting it.",
 ].join("\n");

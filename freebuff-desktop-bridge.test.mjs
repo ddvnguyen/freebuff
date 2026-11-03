@@ -66,13 +66,13 @@ function fixtureServer({ launchIDs, onRequest = () => {} } = {}) {
   }));
 }
 
-function runBridge({ url, stateDir, cwd, resume, prompt = "do the task", launchID, listModels = false }) {
+function runBridge({ url, stateDir, cwd, resume, prompt = "do the task", launchID, listModels = false, token = "" }) {
   return new Promise((resolveRun, reject) => {
     const args = listModels ? [bridge, "--list-models", "--json"] : [bridge, "--output-format", "stream-json", "--input-format", "stream-json"];
     if (resume) args.push("--resume", resume);
     const child = spawn(process.execPath, args, {
       cwd,
-      env: { ...process.env, FREEBUFF_DESKTOP_URL: url, FREEBUFF_DESKTOP_STATE_DIR: stateDir, FREEBUFF_DESKTOP_POLL_MS: "150", ...(launchID ? { FREEBUFF_DESKTOP_LAUNCH_ID: launchID } : {}) },
+      env: { ...process.env, MULTICA_TOKEN: token, FREEBUFF_DESKTOP_URL: url, FREEBUFF_DESKTOP_STATE_DIR: stateDir, FREEBUFF_DESKTOP_POLL_MS: "150", ...(launchID ? { FREEBUFF_DESKTOP_LAUNCH_ID: launchID } : {}) },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -106,10 +106,12 @@ test("expired resume rotates to a fresh thread with task context; valid resume k
     createdAt: new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString(), messages: [],
   });
 
-  const rotated = await runBridge({ url: api.url, stateDir, cwd, resume: "expired" });
+  const rotated = await runBridge({ url: api.url, stateDir, cwd, resume: "expired", token: "test-token" });
   const firstPrompt = api.threads.get("new-1").lastPrompt;
   expect(firstPrompt).toContain("task-specific context");
-  expect(firstPrompt).toContain("pre-authenticated as this agent for this task");
+  expect(firstPrompt).toContain("uses this task's identity");
+  expect(firstPrompt).toContain("issue comment list <issue-id> --roots-only --summary --output json");
+  expect(firstPrompt).not.toMatch(/\b(?:agent|worker)s?\b/i);
   expect(rotated.stdout).toContain('"session_id":"new-1"');
   expect(api.requests.some((request) => request.path === "/api/projects")).toBe(false);
 
@@ -117,10 +119,11 @@ test("expired resume rotates to a fresh thread with task context; valid resume k
     id: "recent", status: "open", turnState: "idle",
     createdAt: new Date(Date.now() - 4 * 60 * 60 * 1000 + 60_000).toISOString(), messages: [],
   });
-  const resumed = await runBridge({ url: api.url, stateDir, cwd, resume: "recent", prompt: "follow-up" });
+  const resumed = await runBridge({ url: api.url, stateDir, cwd, resume: "recent", prompt: "follow-up", token: "test-token" });
   const secondPrompt = api.threads.get("recent").lastPrompt;
   expect(secondPrompt).not.toContain("task-specific context");
-  expect(secondPrompt).toContain("pre-authenticated as this agent for this task");
+  expect(secondPrompt).toContain("uses this task's identity");
+  expect(secondPrompt).not.toMatch(/\b(?:agent|worker)s?\b/i);
   expect(resumed.stdout).toContain('"session_id":"recent"');
   expect(readFileSync(bridgeState, "utf8")).toContain('"thread_id":"recent"');
   expect(readFileSync(orchestratorState, "utf8")).toBe(updatedOrchestratorState);
@@ -161,6 +164,8 @@ test("account bridge caches stay isolated", async () => {
   mkdirSync(accountB, { recursive: true });
 
   await runBridge({ url: api.url, stateDir: accountA, cwd });
+  expect(api.threads.get("new-1").lastPrompt).toContain("Your final answer text IS the deliverable");
+  expect(api.threads.get("new-1").lastPrompt).not.toMatch(/\b(?:agent|worker)s?\b/i);
   await runBridge({ url: api.url, stateDir: accountB, cwd });
   const stateA = JSON.parse(readFileSync(join(accountA, "bridge-state.json"), "utf8"));
   const stateB = JSON.parse(readFileSync(join(accountB, "bridge-state.json"), "utf8"));
