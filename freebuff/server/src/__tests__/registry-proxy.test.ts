@@ -1,10 +1,15 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test'
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createAuth } from '../auth'
 import { startProxy, type ProxyHandle } from '../proxy'
+import { accountIsLive } from '../registry'
 
-const dir = mkdtempSync('/mnt/workspace/tmp/freebuff-registry-test-')
+// A host that keeps temp space off its root filesystem (our deployment does)
+// points FREEBUFF_TEST_TMPDIR at it; anywhere else os.tmpdir() is right.
+const tempRoot = process.env.FREEBUFF_TEST_TMPDIR?.trim() || tmpdir()
+const dir = mkdtempSync(join(tempRoot, 'freebuff-registry-test-'))
 const path = join(dir, 'registry.json')
 const launch = '0123456789abcdef0123456789abcdef'
 let upstream: Bun.Server<unknown>,
@@ -373,6 +378,63 @@ test('switching cancels an existing account event stream', async () => {
     Bun.sleep(1000).then(() => false),
   ])
   expect(ended).toBe(true)
+})
+
+// The real managed orchestrator answers /healthz with {ok, launchId, pid,
+// port} (captured from commit 7807c228, launch id redacted). Only ok+launchId
+// are required: the launch id is random per launch, so it already rules out
+// port and pid reuse, and a build that trims the payload must not turn every
+// account offline.
+test('requires ok and launchId from health, not pid or port', async () => {
+  const minimal = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch: () => Response.json({ ok: true, launchId: launch }),
+  })
+  const account = {
+    accountId: 'a1',
+    runtimeId: 'rt',
+    label: 'Account One',
+    port: minimal.port!,
+    pid: 42,
+    launchId: launch,
+  }
+  try {
+    expect(await accountIsLive(account)).toBe(true)
+    expect(
+      await accountIsLive({ ...account, launchId: 'f'.repeat(32) }),
+    ).toBe(false)
+    expect(await accountIsLive({ ...account, port: minimal.port! + 1 })).toBe(
+      false,
+    )
+  } finally {
+    await minimal.stop(true)
+  }
+})
+
+// One malformed row used to empty the whole registry, hiding healthy accounts.
+test('skips a malformed registry entry without hiding the others', async () => {
+  const valid = {
+    accountId: 'a1',
+    runtimeId: 'rt',
+    label: 'Account One',
+    port: upstream.port,
+    pid: 42,
+    launchId: launch,
+  }
+  writeFileSync(
+    path,
+    JSON.stringify([{ accountId: 'bad' }, valid]),
+    { mode: 0o600 },
+  )
+  try {
+    const page = await fetch(`${base}/__freebuff/accounts`, {
+      headers: { cookie: session },
+    })
+    expect(await page.text()).toContain('Account One')
+  } finally {
+    writeFileSync(path, JSON.stringify([valid]), { mode: 0o600 })
+  }
 })
 
 test('rejects a registry that other users can read or change', async () => {

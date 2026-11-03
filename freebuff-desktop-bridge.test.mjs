@@ -2,12 +2,20 @@ import { afterEach, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const bridge = resolve(import.meta.dir, "freebuff-desktop-bridge.mjs");
-const scratchRoot = "/mnt/workspace/tmp";
+// Hosts that keep temp space off their root filesystem (our deployment does)
+// point FREEBUFF_TEST_TMPDIR at it; anywhere else os.tmpdir() is right.
+const scratchRoot = process.env.FREEBUFF_TEST_TMPDIR?.trim() || tmpdir();
 mkdirSync(scratchRoot, { recursive: true });
-const scratchDirs = [];
+// The task-scoped runtime note is only emitted inside Multica (MULTICA_TOKEN in
+// the environment and a `multica` on PATH). Pin both so the prompt assertions
+// below describe the bridge, not the machine the tests happen to run on.
+const shimBin = mkdtempSync(join(scratchRoot, "freebuff-bridge-bin-"));
+writeFileSync(join(shimBin, "multica"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+const scratchDirs = [shimBin];
 const servers = [];
 
 afterEach(() => {
@@ -72,7 +80,15 @@ function runBridge({ url, stateDir, cwd, resume, prompt = "do the task", launchI
     if (resume) args.push("--resume", resume);
     const child = spawn(process.execPath, args, {
       cwd,
-      env: { ...process.env, FREEBUFF_DESKTOP_URL: url, FREEBUFF_DESKTOP_STATE_DIR: stateDir, FREEBUFF_DESKTOP_POLL_MS: "150", ...(launchID ? { FREEBUFF_DESKTOP_LAUNCH_ID: launchID } : {}) },
+      env: {
+        ...process.env,
+        PATH: `${shimBin}:${process.env.PATH ?? ""}`,
+        MULTICA_TOKEN: process.env.MULTICA_TOKEN || "test-task-token",
+        FREEBUFF_DESKTOP_URL: url,
+        FREEBUFF_DESKTOP_STATE_DIR: stateDir,
+        FREEBUFF_DESKTOP_POLL_MS: "150",
+        ...(launchID ? { FREEBUFF_DESKTOP_LAUNCH_ID: launchID } : {}),
+      },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
