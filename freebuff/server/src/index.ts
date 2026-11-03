@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import path from 'node:path'
 
 import { createAuth } from './auth'
@@ -23,6 +24,9 @@ Environment:
   FREEBUFF_WEB_NO_AUTH         Set to 1 to disable the password gate (trusted networks only)
   FREEBUFF_WEB_CONFIG_DIR      Where config, profile and logs live (default ~/.config/freebuff-web)
   FREEBUFF_WEB_PROFILE         Orchestrator profile path (default <config dir>/state.json)
+  FREEBUFF_WEB_REGISTRY        Daemon registry path; off disables account switching
+                              (default <profiles dir>/registry.json, where the profiles
+                              dir is FREEBUFF_PROFILES_DIR or ~/.config/multica/freebuff)
   FREEBUFF_WEB_TLS_CERT        PEM certificate for HTTPS (must be paired with FREEBUFF_WEB_TLS_KEY)
   FREEBUFF_WEB_TLS_KEY         PEM private key for HTTPS
   FREEBUFF_APP_PATH            Freebuff Desktop app bundle or its Resources directory
@@ -31,6 +35,22 @@ Environment:
 The server never opens the Desktop app's live profile. It runs its own orchestrator
 on a loopback port and puts this password-protected proxy in front.
 `
+
+/**
+ * Where the Multica daemon publishes its managed-instance registry.
+ *
+ * The daemon resolves its profiles root the same way
+ * (`FreebuffProfileDir` in multica's `server/pkg/agent/freebuff.go`):
+ * `FREEBUFF_PROFILES_DIR` when set, else `~/.config/multica/freebuff`. No host
+ * path is baked in, so an upstream checkout and CI resolve it the same way our
+ * deployment does.
+ */
+export function defaultRegistryPath(): string {
+  const root =
+    process.env.FREEBUFF_PROFILES_DIR?.trim() ||
+    path.join(homedir(), '.config', 'multica', 'freebuff')
+  return path.join(root, 'registry.json')
+}
 
 function printBanner(options: {
   version: string | null
@@ -168,6 +188,10 @@ async function main(): Promise<void> {
       hostname: config.hostname,
       port: config.port,
       orchestratorPort: orchestrator.port,
+      registryPath:
+        process.env.FREEBUFF_WEB_REGISTRY === 'off'
+          ? null
+          : process.env.FREEBUFF_WEB_REGISTRY?.trim() || defaultRegistryPath(),
       auth,
       secureCookie: !!tls,
       tls,

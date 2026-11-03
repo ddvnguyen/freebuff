@@ -2,12 +2,20 @@ import { afterEach, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const bridge = resolve(import.meta.dir, "freebuff-desktop-bridge.mjs");
-const scratchRoot = "/mnt/workspace/tmp";
+// Hosts that keep temp space off their root filesystem (our deployment does)
+// point FREEBUFF_TEST_TMPDIR at it; anywhere else os.tmpdir() is right.
+const scratchRoot = process.env.FREEBUFF_TEST_TMPDIR?.trim() || tmpdir();
 mkdirSync(scratchRoot, { recursive: true });
-const scratchDirs = [];
+// The task-scoped runtime note is only emitted inside Multica (MULTICA_TOKEN in
+// the environment and a `multica` on PATH). Pin both so the prompt assertions
+// below describe the bridge, not the machine the tests happen to run on.
+const shimBin = mkdtempSync(join(scratchRoot, "freebuff-bridge-bin-"));
+writeFileSync(join(shimBin, "multica"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+const scratchDirs = [shimBin];
 const servers = [];
 
 afterEach(() => {
@@ -72,7 +80,15 @@ function runBridge({ url, stateDir, cwd, resume, prompt = "do the task", launchI
     if (resume) args.push("--resume", resume);
     const child = spawn(process.execPath, args, {
       cwd,
-      env: { ...process.env, FREEBUFF_DESKTOP_URL: url, FREEBUFF_DESKTOP_STATE_DIR: stateDir, FREEBUFF_DESKTOP_POLL_MS: "150", ...(launchID ? { FREEBUFF_DESKTOP_LAUNCH_ID: launchID } : {}) },
+      env: {
+        ...process.env,
+        PATH: `${shimBin}:${process.env.PATH ?? ""}`,
+        MULTICA_TOKEN: process.env.MULTICA_TOKEN || "test-task-token",
+        FREEBUFF_DESKTOP_URL: url,
+        FREEBUFF_DESKTOP_STATE_DIR: stateDir,
+        FREEBUFF_DESKTOP_POLL_MS: "150",
+        ...(launchID ? { FREEBUFF_DESKTOP_LAUNCH_ID: launchID } : {}),
+      },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -85,7 +101,7 @@ function runBridge({ url, stateDir, cwd, resume, prompt = "do the task", launchI
   });
 }
 
-test("expired resume rotates to a fresh thread with task context; valid resume keeps task identity without reinjecting context", async () => {
+test("resume and cached IDs never touch or stop a human thread", async () => {
   const dir = mkdtempSync(join(scratchRoot, "freebuff-bridge-test-"));
   scratchDirs.push(dir);
   const stateDir = join(dir, "account-state");
@@ -96,33 +112,30 @@ test("expired resume rotates to a fresh thread with task context; valid resume k
   const bridgeState = join(stateDir, "bridge-state.json");
   const orchestratorState = join(stateDir, "state.json");
   const updatedOrchestratorState = '{"auth":{"revision":2}}';
-  writeFileSync(bridgeState, JSON.stringify({ thread_id: "expired" }));
+  writeFileSync(bridgeState, JSON.stringify({ thread_id: "human" }));
   writeFileSync(orchestratorState, '{"auth":{"revision":1}}');
   const api = await fixtureServer({ onRequest: ({ method, path }) => {
     if (method === "POST" && path === "/api/threads") writeFileSync(orchestratorState, updatedOrchestratorState);
   } });
-  api.threads.set("expired", {
-    id: "expired", status: "open", turnState: "idle",
-    createdAt: new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString(), messages: [],
+  api.threads.set("human", {
+    id: "human", status: "open", turnState: "running",
+    createdAt: new Date().toISOString(), messages: [],
   });
 
-  const rotated = await runBridge({ url: api.url, stateDir, cwd, resume: "expired" });
+  const rotated = await runBridge({ url: api.url, stateDir, cwd, resume: "human" });
   const firstPrompt = api.threads.get("new-1").lastPrompt;
   expect(firstPrompt).toContain("task-specific context");
   expect(firstPrompt).toContain("pre-authenticated as this agent for this task");
   expect(rotated.stdout).toContain('"session_id":"new-1"');
   expect(api.requests.some((request) => request.path === "/api/projects")).toBe(false);
 
-  api.threads.set("recent", {
-    id: "recent", status: "open", turnState: "idle",
-    createdAt: new Date(Date.now() - 4 * 60 * 60 * 1000 + 60_000).toISOString(), messages: [],
-  });
-  const resumed = await runBridge({ url: api.url, stateDir, cwd, resume: "recent", prompt: "follow-up" });
-  const secondPrompt = api.threads.get("recent").lastPrompt;
-  expect(secondPrompt).not.toContain("task-specific context");
+  const resumed = await runBridge({ url: api.url, stateDir, cwd, resume: "human", prompt: "follow-up" });
+  const secondPrompt = api.threads.get("new-2").lastPrompt;
+  expect(secondPrompt).toContain("task-specific context");
   expect(secondPrompt).toContain("pre-authenticated as this agent for this task");
-  expect(resumed.stdout).toContain('"session_id":"recent"');
-  expect(readFileSync(bridgeState, "utf8")).toContain('"thread_id":"recent"');
+  expect(resumed.stdout).toContain('"session_id":"new-2"');
+  expect(api.requests.some((request) => request.path.startsWith("/api/thread/human"))).toBe(false);
+  expect(api.threads.get("human").turnState).toBe("running");
   expect(readFileSync(orchestratorState, "utf8")).toBe(updatedOrchestratorState);
 });
 
@@ -145,11 +158,10 @@ test("launch ID authenticates model discovery and task APIs, and a restarted bri
   const restartedRequests = api.requests.slice(beforeRestart);
   expect(restartedRequests.length).toBeGreaterThan(0);
   expect(restartedRequests.every((request) => request.launchID === "launch-two")).toBe(true);
-  expect(restartedRequests.some((request) => request.path === "/api/thread/new-1/message")).toBe(true);
-  expect(readFileSync(join(stateDir, "bridge-state.json"), "utf8")).not.toContain("launch-two");
+  expect(restartedRequests.some((request) => request.path === "/api/thread/new-2/message")).toBe(true);
 });
 
-test("account bridge caches stay isolated", async () => {
+test("account bridge runs create separate threads", async () => {
   const api = await fixtureServer();
   const dir = mkdtempSync(join(scratchRoot, "freebuff-bridge-accounts-test-"));
   scratchDirs.push(dir);
@@ -162,8 +174,7 @@ test("account bridge caches stay isolated", async () => {
 
   await runBridge({ url: api.url, stateDir: accountA, cwd });
   await runBridge({ url: api.url, stateDir: accountB, cwd });
-  const stateA = JSON.parse(readFileSync(join(accountA, "bridge-state.json"), "utf8"));
-  const stateB = JSON.parse(readFileSync(join(accountB, "bridge-state.json"), "utf8"));
-  expect(stateA.thread_id).toBe("new-1");
-  expect(stateB.thread_id).toBe("new-2");
+  expect(api.threads.has("new-1")).toBe(true);
+  expect(api.threads.has("new-2")).toBe(true);
+  expect(api.requests.filter((request) => request.path.endsWith("/stop"))).toHaveLength(0);
 });

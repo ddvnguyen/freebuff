@@ -140,19 +140,43 @@ security notes below before exposing the port beyond a trusted network.
 
 ## Configuration
 
-| Variable                  | Default                          | Meaning                                               |
-| ------------------------- | -------------------------------- | ----------------------------------------------------- |
-| `FREEBUFF_WEB_PORT`       | `4310`                           | Listen port (`0` picks a random free port)            |
-| `FREEBUFF_WEB_HOST`       | `0.0.0.0`                        | Bind address; use `127.0.0.1` for this Mac only       |
-| `FREEBUFF_WEB_PASSWORD`   | generated on first run           | Login password; not written to disk                   |
-| `FREEBUFF_WEB_NO_AUTH`    | unset                            | `1` disables the password gate entirely               |
-| `FREEBUFF_WEB_CONFIG_DIR` | `~/.config/freebuff-web`         | Config, profile and logs                              |
-| `FREEBUFF_WEB_PROFILE`    | `<config dir>/state.json`        | Orchestrator profile for this server                  |
-| `FREEBUFF_WEB_TLS_CERT`   | none                             | PEM certificate for HTTPS                             |
-| `FREEBUFF_WEB_TLS_KEY`    | none                             | PEM private key; required with the certificate        |
-| `FREEBUFF_APP_PATH`       | auto-detected                    | Freebuff app bundle, `Resources` dir, or orchestrator |
-| `FREEBUFF_RUNTIME_DIR`    | `freebuff/server/runtime`        | Force an exported runtime instead of a Desktop install |
-| `FREEBUFF_DESKTOP_STATE`  | `~/.config/freebuff-desktop/...` | Desktop state used to seed projects on first run      |
+| Variable                  | Default                            | Meaning                                                |
+| ------------------------- | ---------------------------------- | ------------------------------------------------------ |
+| `FREEBUFF_WEB_PORT`       | `4310`                             | Listen port (`0` picks a random free port)             |
+| `FREEBUFF_WEB_HOST`       | `0.0.0.0`                          | Bind address; use `127.0.0.1` for this Mac only        |
+| `FREEBUFF_WEB_PASSWORD`   | generated on first run             | Login password; not written to disk                    |
+| `FREEBUFF_WEB_NO_AUTH`    | unset                              | `1` disables the password gate entirely                |
+| `FREEBUFF_WEB_CONFIG_DIR` | `~/.config/freebuff-web`           | Config, profile and logs                               |
+| `FREEBUFF_WEB_PROFILE`    | `<config dir>/state.json`          | Orchestrator profile for this server                   |
+| `FREEBUFF_WEB_REGISTRY`   | `<profiles dir>/registry.json`     | Daemon account registry path; `off` disables switching |
+| `FREEBUFF_WEB_TLS_CERT`   | none                               | PEM certificate for HTTPS                              |
+| `FREEBUFF_WEB_TLS_KEY`    | none                               | PEM private key; required with the certificate         |
+| `FREEBUFF_APP_PATH`       | auto-detected                      | Freebuff app bundle, `Resources` dir, or orchestrator  |
+| `FREEBUFF_RUNTIME_DIR`    | `freebuff/server/runtime`          | Force an exported runtime instead of a Desktop install |
+| `FREEBUFF_DESKTOP_STATE`  | `~/.config/freebuff-desktop/...`   | Desktop state used to seed projects on first run      |
+
+When password authentication is enabled, the account link opens a selector for
+the default web profile and daemon-managed accounts. Selection changes only
+this browser session; Multica task leases remain independent. Switching closes
+open sockets and reloads the UI. The selector uses the existing web password.
+The daemon and web service must run as the same OS user so the service can read
+the mode-0600 registry. The default registry path is the daemon's profiles root
+plus `registry.json` — `$FREEBUFF_PROFILES_DIR` when set, else
+`~/.config/multica/freebuff`; set `FREEBUFF_WEB_REGISTRY` to an absolute path
+when the two disagree. Use one daemon per profiles directory: each daemon
+replaces that directory's registry. The registry is a hint and may lag daemon
+state; the proxy checks the live process identity before routing and displays
+stale entries as offline, and a malformed entry is skipped rather than hiding
+the others. A missing registry leaves only the default profile. Set
+`FREEBUFF_WEB_REGISTRY=off` to restore the single-profile proxy. Do not share
+the registry file or its tokens.
+
+Each Desktop bridge run creates a fresh thread and ignores resume IDs. That is
+deliberate: a Multica run must never adopt or stop a conversation a person is
+using in the web UI. The cost is that consecutive runs on the same account no
+longer continue one conversation, so a follow-up comment re-injects the task
+instructions instead of resuming. Resuming only bridge-created thread IDs is a
+planned follow-up.
 
 To change the password, set `FREEBUFF_WEB_PASSWORD` before starting. The value
 is hashed in memory and takes precedence over the stored hash. Removing the

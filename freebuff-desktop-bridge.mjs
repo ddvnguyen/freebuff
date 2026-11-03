@@ -6,17 +6,13 @@
 // endpoint, FREEBUFF_DESKTOP_CREDENTIAL_REF points at a daemon-local reference
 // (e.g. a token file / FB_HOME dir) the bridge resolves itself. Credentials
 // never travel through Multica's DB.
-import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync, renameSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 
 const FB_URL = (process.env.FREEBUFF_DESKTOP_URL || process.env.FB_URL || "http://localhost:4320").replace(/\/+$/, "");
 const LAUNCH_ID = process.env.FREEBUFF_DESKTOP_LAUNCH_ID || "";
 const LAUNCH_HEADERS = LAUNCH_ID ? { "x-freebuff-launch-id": LAUNCH_ID } : {};
-// Per-account state (the reusable thread id) lives beside the installed
-// bridge: Multica hands every run a fresh workdir, so a workdir default would
-// create a new desktop session on every run. FREEBUFF_DESKTOP_STATE_DIR and the
-// account's credential ref (FB_HOME) still win, e.g. for per-account isolation;
-// credentials never travel through Multica's DB. Never a fixed host path.
+// The account reference identifies the profile; every bridge run uses a new thread.
 const CREDENTIAL_REF = process.env.FREEBUFF_DESKTOP_CREDENTIAL_REF || process.env.FB_HOME || "";
 const INSTALL_DIR = (process.argv[1] && existsSync(process.argv[1]) ? dirname(realpathSync(process.argv[1])) : process.cwd());
 const HOME_DIR = resolve(CREDENTIAL_REF || process.env.FREEBUFF_DESKTOP_STATE_DIR || join(INSTALL_DIR, ".freebuff-desktop-state"));
@@ -54,7 +50,6 @@ function parseArgs(argv) {
 }
 const ARGS = parseArgs(process.argv.slice(2));
 const STDIN_PROMPT = process.argv.includes("--input-format") || !process.stdin.isTTY;
-const THREAD_MAX_AGE_MS = 4 * 60 * 60 * 1000;
 // The one entry the bridge used to advertise; also what "no --model" means.
 const DEFAULT_MODEL_ID = "freebuff-desktop";
 const MODEL = ARGS.model && ARGS.model !== DEFAULT_MODEL_ID ? ARGS.model : "";
@@ -141,9 +136,6 @@ if (ARGS.listModels) {
 }
 
 mkdirSync(HOME_DIR, { recursive: true });
-const STATE = join(HOME_DIR, "bridge-state.json");
-let state = {};
-if (existsSync(STATE)) try { state = JSON.parse(readFileSync(STATE, "utf8")); } catch {}
 
 // The daemon sends the prompt on stdin as stream-json user messages
 // ({"type":"user","message":{"content":"..."|[{"type":"text","text":"..."}]}});
@@ -238,38 +230,11 @@ async function api(path, opts = {}) {
   return r.json();
 }
 
-// One reusable thread per model: a thread's model is fixed when it is created.
-// The default (no --model) keeps the original top-level thread_id.
-state.threads = state.threads || {};
-// Adopt only threads explicitly owned by this account's state or requested by
-// the daemon, and only while they are younger than the rotation window. A
-// project-wide idle-thread scan can cross task/project boundaries and would
-// re-adopt expired conversations, so missing or stale state always starts a
-// fresh thread.
-async function adopt(id) {
-  try {
-    const r = await api(`/api/thread/${id}`);
-    const t = r.thread;
-    const createdAt = Date.parse(t?.createdAt || t?.created_at || "");
-    const age = Date.now() - createdAt;
-    if (t && t.status === "open" && !t.archivedAt && Number.isFinite(createdAt) && age >= 0 && age < THREAD_MAX_AGE_MS) return t;
-  } catch {}
-  return null;
-}
-let tinfo = null;
-let tid = null;
-let createdThread = false;
-for (const id of [ARGS.resume, MODEL ? state.threads[MODEL] : state.thread_id].filter(Boolean)) {
-  tinfo = await adopt(id);
-  if (tinfo) { tid = id; break; }
-}
-if (!tid) {
-  const body = { projectPath: HOME_DIR, ...(MODEL ? { harnessId: "codebuff", model: MODEL } : {}) };
-  const r = await api("/api/threads", { method: "POST", body: JSON.stringify(body) });
-  tid = r.id;
-  createdThread = true;
-}
-if (createdThread) {
+// A resume ID may refer to a human's conversation. Never adopt or stop it.
+const body = { projectPath: HOME_DIR, ...(MODEL ? { harnessId: "codebuff", model: MODEL } : {}) };
+const created = await api("/api/threads", { method: "POST", body: JSON.stringify(body) });
+const tid = created.id;
+{
   // The bridge owns thread creation/rotation, so it also owns creation-time
   // task context. This covers expired/invalid --resume IDs without duplicating
   // the full context on ordinary resumes.
@@ -280,16 +245,7 @@ if (createdThread) {
     }
   } catch {}
 }
-const known = MODEL ? state.threads[MODEL] : state.thread_id;
-if (known !== tid) {
-  if (MODEL) state.threads[MODEL] = tid; else state.thread_id = tid;
-  saveState();
-}
-
 async function threadState() { const r = await api(`/api/thread/${tid}`); return r.thread; }
-if (tinfo?.turnState === "running") {
-  await api(`/api/thread/${tid}/stop`, { method: "POST", body: "{}" }).catch(() => {});
-}
 // Streaming. The desktop does NOT push message deltas over /api/events (that
 // stream carries state/thread/auth frames only, verified against 0.0.188), but
 // GET /api/thread/:id is a live view of the turn: parts grow in place (text
@@ -429,11 +385,5 @@ emit({ type: "result", result: finalText, is_error: false, session_id: tid, num_
 
 process.exit(0);
 
-function saveState(){
-  // Atomic: several runs may share this state dir, a torn write would strand
-  // a reusable thread id behind a JSON parse failure.
-  writeFileSync(STATE + ".tmp", JSON.stringify(state));
-  renameSync(STATE + ".tmp", STATE);
-}
 function emit(o){ process.stdout.write(JSON.stringify(o) + "\n"); }
 function sleep(ms){ return new Promise(res=>setTimeout(res,ms)); }
