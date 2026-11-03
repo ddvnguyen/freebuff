@@ -15,7 +15,7 @@ afterEach(() => {
   for (const dir of scratchDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function fixtureServer({ launchIDs, onRequest = () => {} } = {}) {
+function fixtureServer({ launchIDs, onRequest = () => {}, stuck = false } = {}) {
   const requests = [];
   const threads = new Map();
   let sequence = 0;
@@ -54,6 +54,7 @@ function fixtureServer({ launchIDs, onRequest = () => {} } = {}) {
     if (req.method === "POST" && messageMatch) {
       const thread = threads.get(decodeURIComponent(messageMatch[1]));
       const message = JSON.parse(body);
+      if (stuck) thread.turnState = "running";
       thread.messages = [{ role: "assistant", parts: [{ kind: "text", text: "done" }] }];
       thread.lastPrompt = message.text;
       return json({ ok: true });
@@ -66,13 +67,13 @@ function fixtureServer({ launchIDs, onRequest = () => {} } = {}) {
   }));
 }
 
-function runBridge({ url, stateDir, cwd, resume, prompt = "do the task", launchID, listModels = false, token = "" }) {
+function runBridge({ url, stateDir, cwd, resume, prompt = "do the task", launchID, listModels = false, token = "", timeoutMs }) {
   return new Promise((resolveRun, reject) => {
     const args = listModels ? [bridge, "--list-models", "--json"] : [bridge, "--output-format", "stream-json", "--input-format", "stream-json"];
     if (resume) args.push("--resume", resume);
     const child = spawn(process.execPath, args, {
       cwd,
-      env: { ...process.env, MULTICA_TOKEN: token, FREEBUFF_DESKTOP_URL: url, FREEBUFF_DESKTOP_STATE_DIR: stateDir, FREEBUFF_DESKTOP_POLL_MS: "150", ...(launchID ? { FREEBUFF_DESKTOP_LAUNCH_ID: launchID } : {}) },
+      env: { ...process.env, MULTICA_TOKEN: token, FREEBUFF_DESKTOP_URL: url, FREEBUFF_DESKTOP_STATE_DIR: stateDir, FREEBUFF_DESKTOP_POLL_MS: "150", ...(launchID ? { FREEBUFF_DESKTOP_LAUNCH_ID: launchID } : {}), ...(timeoutMs ? { FREEBUFF_DESKTOP_TIMEOUT_MS: String(timeoutMs) } : {}) },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -84,6 +85,14 @@ function runBridge({ url, stateDir, cwd, resume, prompt = "do the task", launchI
     if (!listModels) child.stdin.end(JSON.stringify({ type: "user", message: { content: prompt } }) + "\n");
   });
 }
+
+test("a running turn at the deadline fails instead of reporting success", async () => {
+  const dir = mkdtempSync(join(scratchRoot, "freebuff-bridge-timeout-"));
+  scratchDirs.push(dir);
+  const api = await fixtureServer({ stuck: true });
+  await expect(runBridge({ url: api.url, stateDir: dir, cwd: dir, timeoutMs: 150 })).rejects.toThrow("provider work may still be running");
+  expect(api.requests.some((r) => r.path.endsWith("/stop"))).toBe(false);
+});
 
 test("fresh and resumed threads reference project instructions without copying them into the prompt", async () => {
   const dir = mkdtempSync(join(scratchRoot, "freebuff-bridge-test-"));

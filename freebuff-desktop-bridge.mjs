@@ -392,7 +392,10 @@ function pump(msgs, final = false) {
 }
 
 // 30 minutes at the default cadence; the old fixed loop gave up at 20.
-const MAX_POLLS = Math.ceil(1_800_000 / POLL_MS);
+const requestedTimeout = Number(process.env.FREEBUFF_DESKTOP_TIMEOUT_MS);
+const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout >= 150 ? Math.min(requestedTimeout, 1_800_000) : 1_800_000;
+const MAX_POLLS = Math.ceil(timeoutMs / POLL_MS);
+let turnCompleted = false;
 for (let i = 0; i < MAX_POLLS; i++) {
   let r;
   try {
@@ -402,8 +405,15 @@ for (let i = 0; i < MAX_POLLS; i++) {
     continue;
   }
   pump(r.messages || []);
-  if ((r.thread || {}).turnState !== "running") break;
+  if (typeof r.thread?.turnState === "string" && r.thread.turnState !== "running") { turnCompleted = true; break; }
   await sleep(POLL_MS);
+}
+
+if (!turnCompleted) {
+  // A reused thread may belong to another active turn. Never stop it without
+  // verified ownership; a failed result must not be reported as success.
+  console.error("Freebuff Desktop turn did not finish before the polling deadline; provider work may still be running.");
+  process.exit(1);
 }
 
 // Final read: the slice produced between the last poll and the turn going idle.
