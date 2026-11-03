@@ -222,12 +222,13 @@ const RUNTIME_OVERRIDE = SHIM ? [
   `Use \`${SHIM}\` as the Multica CLI from ${process.cwd()}. It uses this task's identity; a bare \`multica\` uses the machine owner's identity and must not be used.`,
   `To read the assigned issue, use \`${SHIM} issue get <issue-id> --output json\`; use \`${SHIM} issue comment list <issue-id> --roots-only --summary --output json\` to find relevant discussions.`,
   "Never print, read or copy the contents of that shim or of any file under /home config; never write outside the task directory.",
-  "Follow the task instructions (CODEBUDDY.md in the task directory) for how to read the issue and post results, substituting the shim path for `multica`.",
+  `Read the project instructions in \`${join(process.cwd(), "AGENTS.md")}\` when present, including how to report results. Use the task-scoped CLI path above for Multica commands.`,
 ].join("\n") : [
   "",
   "RUNTIME OVERRIDE (higher priority than any instruction above):",
   "You are NOT inside the Multica runtime. The `multica` CLI visible on this machine belongs to the machine owner and MUST NOT be used: never run `multica` to read issues, list comments, or write comments/mentions.",
   "Your final answer text IS the deliverable: when your turn ends, Multica publishes it to the issue automatically under your task identity.",
+  `Read the project instructions in \`${join(process.cwd(), "AGENTS.md")}\` when present.`,
   "Never touch machine owner files (identity, /home config) and never write outside the task directory.",
   "If a task genuinely needs the multica CLI or repo checkout, state that as a plain blocker in your answer instead of attempting it.",
 ].join("\n");
@@ -259,7 +260,6 @@ async function adopt(id) {
 }
 let tinfo = null;
 let tid = null;
-let createdThread = false;
 for (const id of [ARGS.resume, MODEL ? state.threads[MODEL] : state.thread_id].filter(Boolean)) {
   tinfo = await adopt(id);
   if (tinfo) { tid = id; break; }
@@ -268,18 +268,6 @@ if (!tid) {
   const body = { projectPath: HOME_DIR, ...(MODEL ? { harnessId: "codebuff", model: MODEL } : {}) };
   const r = await api("/api/threads", { method: "POST", body: JSON.stringify(body) });
   tid = r.id;
-  createdThread = true;
-}
-if (createdThread) {
-  // The bridge owns thread creation/rotation, so it also owns creation-time
-  // task context. This covers expired/invalid --resume IDs without duplicating
-  // the full context on ordinary resumes.
-  try {
-    const context = readFileSync(join(process.cwd(), "CODEBUDDY.md"), "utf8").trim();
-    if (context && !rawPrompt.includes(context)) {
-      prompt = "Context for this task (from CODEBUDDY.md). Follow the task-scoped runtime instructions below.\n\n" + context + "\n\n---\n\n" + prompt;
-    }
-  } catch {}
 }
 const known = MODEL ? state.threads[MODEL] : state.thread_id;
 if (known !== tid) {

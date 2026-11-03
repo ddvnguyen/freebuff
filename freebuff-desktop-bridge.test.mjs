@@ -85,14 +85,14 @@ function runBridge({ url, stateDir, cwd, resume, prompt = "do the task", launchI
   });
 }
 
-test("expired resume rotates to a fresh thread with task context; valid resume keeps task identity without reinjecting context", async () => {
+test("fresh and resumed threads reference project instructions without copying them into the prompt", async () => {
   const dir = mkdtempSync(join(scratchRoot, "freebuff-bridge-test-"));
   scratchDirs.push(dir);
   const stateDir = join(dir, "account-state");
   const cwd = join(dir, "task");
   mkdirSync(stateDir, { recursive: true });
   mkdirSync(cwd, { recursive: true });
-  writeFileSync(join(cwd, "CODEBUDDY.md"), "task-specific context");
+  writeFileSync(join(cwd, "AGENTS.md"), "task-specific context");
   const bridgeState = join(stateDir, "bridge-state.json");
   const orchestratorState = join(stateDir, "state.json");
   const updatedOrchestratorState = '{"auth":{"revision":2}}';
@@ -108,10 +108,12 @@ test("expired resume rotates to a fresh thread with task context; valid resume k
 
   const rotated = await runBridge({ url: api.url, stateDir, cwd, resume: "expired", token: "test-token" });
   const firstPrompt = api.threads.get("new-1").lastPrompt;
-  expect(firstPrompt).toContain("task-specific context");
+  expect(firstPrompt).not.toContain("task-specific context");
+  expect(firstPrompt).toContain(join(cwd, "AGENTS.md"));
+  expect(firstPrompt).not.toContain("CODEBUDDY.md");
   expect(firstPrompt).toContain("uses this task's identity");
   expect(firstPrompt).toContain("issue comment list <issue-id> --roots-only --summary --output json");
-  expect(firstPrompt).not.toMatch(/\b(?:agent|worker)s?\b/i);
+  expect(firstPrompt.replaceAll(/`[^`]*`/g, "")).not.toMatch(/\b(?:agent|worker)s?\b/i);
   expect(rotated.stdout).toContain('"session_id":"new-1"');
   expect(api.requests.some((request) => request.path === "/api/projects")).toBe(false);
 
@@ -122,8 +124,9 @@ test("expired resume rotates to a fresh thread with task context; valid resume k
   const resumed = await runBridge({ url: api.url, stateDir, cwd, resume: "recent", prompt: "follow-up", token: "test-token" });
   const secondPrompt = api.threads.get("recent").lastPrompt;
   expect(secondPrompt).not.toContain("task-specific context");
+  expect(secondPrompt).toContain(join(cwd, "AGENTS.md"));
   expect(secondPrompt).toContain("uses this task's identity");
-  expect(secondPrompt).not.toMatch(/\b(?:agent|worker)s?\b/i);
+  expect(secondPrompt.replaceAll(/`[^`]*`/g, "")).not.toMatch(/\b(?:agent|worker)s?\b/i);
   expect(resumed.stdout).toContain('"session_id":"recent"');
   expect(readFileSync(bridgeState, "utf8")).toContain('"thread_id":"recent"');
   expect(readFileSync(orchestratorState, "utf8")).toBe(updatedOrchestratorState);
@@ -165,7 +168,7 @@ test("account bridge caches stay isolated", async () => {
 
   await runBridge({ url: api.url, stateDir: accountA, cwd });
   expect(api.threads.get("new-1").lastPrompt).toContain("Your final answer text IS the deliverable");
-  expect(api.threads.get("new-1").lastPrompt).not.toMatch(/\b(?:agent|worker)s?\b/i);
+  expect(api.threads.get("new-1").lastPrompt.replaceAll(/`[^`]*`/g, "")).not.toMatch(/\b(?:agent|worker)s?\b/i);
   await runBridge({ url: api.url, stateDir: accountB, cwd });
   const stateA = JSON.parse(readFileSync(join(accountA, "bridge-state.json"), "utf8"));
   const stateB = JSON.parse(readFileSync(join(accountB, "bridge-state.json"), "utf8"));
