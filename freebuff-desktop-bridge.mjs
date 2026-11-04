@@ -219,14 +219,16 @@ const SHIM = writeMulticaShim();
 const RUNTIME_OVERRIDE = SHIM ? [
   "",
   "RUNTIME NOTE (applies to the instructions above):",
-  `Run the Multica CLI ONLY as \`${SHIM}\` (same arguments as \`multica\`), from the task directory ${process.cwd()}. It is pre-authenticated as this agent for this task. Never run a bare \`multica\`: on this machine it belongs to the machine owner and would post as them.`,
+  `Use \`${SHIM}\` as the Multica CLI from ${process.cwd()}. It uses this task's identity; a bare \`multica\` uses the machine owner's identity and must not be used.`,
+  `To read the assigned issue, use \`${SHIM} issue get <issue-id> --output json\`; use \`${SHIM} issue comment list <issue-id> --roots-only --summary --output json\` to find relevant discussions.`,
   "Never print, read or copy the contents of that shim or of any file under /home config; never write outside the task directory.",
-  "Follow the task instructions (CODEBUDDY.md in the task directory) for how to read the issue and post results, substituting the shim path for `multica`.",
+  `Read the project instructions in \`${join(process.cwd(), "AGENTS.md")}\` when present, including how to report results. Use the task-scoped CLI path above for Multica commands.`,
 ].join("\n") : [
   "",
   "RUNTIME OVERRIDE (higher priority than any instruction above):",
   "You are NOT inside the Multica runtime. The `multica` CLI visible on this machine belongs to the machine owner and MUST NOT be used: never run `multica` to read issues, list comments, or write comments/mentions.",
-  "Your final answer text IS the deliverable: when your turn ends, Multica publishes it to the issue automatically, attributed to the agent (you).",
+  "Your final answer text IS the deliverable: when your turn ends, Multica publishes it to the issue automatically under your task identity.",
+  `Read the project instructions in \`${join(process.cwd(), "AGENTS.md")}\` when present.`,
   "Never touch machine owner files (identity, /home config) and never write outside the task directory.",
   "If a task genuinely needs the multica CLI or repo checkout, state that as a plain blocker in your answer instead of attempting it.",
 ].join("\n");
@@ -258,7 +260,6 @@ async function adopt(id) {
 }
 let tinfo = null;
 let tid = null;
-let createdThread = false;
 for (const id of [ARGS.resume, MODEL ? state.threads[MODEL] : state.thread_id].filter(Boolean)) {
   tinfo = await adopt(id);
   if (tinfo) { tid = id; break; }
@@ -267,28 +268,15 @@ if (!tid) {
   const body = { projectPath: HOME_DIR, ...(MODEL ? { harnessId: "codebuff", model: MODEL } : {}) };
   const r = await api("/api/threads", { method: "POST", body: JSON.stringify(body) });
   tid = r.id;
-  createdThread = true;
 }
-if (createdThread) {
-  // The bridge owns thread creation/rotation, so it also owns creation-time
-  // task context. This covers expired/invalid --resume IDs without duplicating
-  // the full context on ordinary resumes.
-  try {
-    const context = readFileSync(join(process.cwd(), "CODEBUDDY.md"), "utf8").trim();
-    if (context && !rawPrompt.includes(context)) {
-      prompt = "Context for this task (from CODEBUDDY.md). Follow the task-scoped runtime instructions below.\n\n" + context + "\n\n---\n\n" + prompt;
-    }
-  } catch {}
+if (tinfo?.turnState === "running") {
+  console.error("Freebuff Desktop thread is already running; its turn ownership is unknown.");
+  process.exit(1);
 }
 const known = MODEL ? state.threads[MODEL] : state.thread_id;
 if (known !== tid) {
   if (MODEL) state.threads[MODEL] = tid; else state.thread_id = tid;
   saveState();
-}
-
-async function threadState() { const r = await api(`/api/thread/${tid}`); return r.thread; }
-if (tinfo?.turnState === "running") {
-  await api(`/api/thread/${tid}/stop`, { method: "POST", body: "{}" }).catch(() => {});
 }
 // Streaming. The desktop does NOT push message deltas over /api/events (that
 // stream carries state/thread/auth frames only, verified against 0.0.188), but
@@ -310,14 +298,6 @@ const emitToolResult = (id, output, isError) => {
 const emitToolUse = (id, name, input) => {
   emit({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id, name, input: input || {} }], model: MODEL_TAG } });
 };
-
-// A stop can leave the previous turn "running"; waiting it out burned up to five
-// minutes on a run that already looked hung, so bound the wait and move on.
-for (let i = 0; i < Math.ceil(60_000 / POLL_MS); i++) {
-  const t = await threadState();
-  if (t.turnState !== "running") break;
-  await sleep(POLL_MS);
-}
 
 emit({ type: "system", subtype: "init", session_id: tid });
 
@@ -403,7 +383,10 @@ function pump(msgs, final = false) {
 }
 
 // 30 minutes at the default cadence; the old fixed loop gave up at 20.
-const MAX_POLLS = Math.ceil(1_800_000 / POLL_MS);
+const requestedTimeout = Number(process.env.FREEBUFF_DESKTOP_TIMEOUT_MS);
+const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout >= 150 ? Math.min(requestedTimeout, 1_800_000) : 1_800_000;
+const MAX_POLLS = Math.ceil(timeoutMs / POLL_MS);
+let turnCompleted = false;
 for (let i = 0; i < MAX_POLLS; i++) {
   let r;
   try {
@@ -413,8 +396,15 @@ for (let i = 0; i < MAX_POLLS; i++) {
     continue;
   }
   pump(r.messages || []);
-  if ((r.thread || {}).turnState !== "running") break;
+  if (typeof r.thread?.turnState === "string" && r.thread.turnState !== "running") { turnCompleted = true; break; }
   await sleep(POLL_MS);
+}
+
+if (!turnCompleted) {
+  // A reused thread may belong to another active turn. Never stop it without
+  // verified ownership; a failed result must not be reported as success.
+  console.error("Freebuff Desktop turn did not finish before the polling deadline; provider work may still be running.");
+  process.exit(1);
 }
 
 // Final read: the slice produced between the last poll and the turn going idle.
