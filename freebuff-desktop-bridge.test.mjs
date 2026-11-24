@@ -290,6 +290,22 @@ test("M-563: refusal hard-stops with exit 3 and never posts the task", async () 
   expect(thread.paused).toBe(true);
 });
 
+test("M-563: stuck thread with attention exits fast, no hang", async () => {
+  const api = await fixtureServer({
+    threadFields: { pendingWorkCount: 2, attentionReason: "failed", missionStatus: { kind: "stopped", note: "slot busy", outcome: "error" } },
+  });
+  const dir = mkdtempSync(join(scratchRoot, "freebuff-bridge-stuck-"));
+  scratchDirs.push(dir);
+  const stateDir = join(dir, "account-state");
+  const cwd = join(dir, "task");
+  mkdirSync(stateDir, { recursive: true });
+  mkdirSync(cwd, { recursive: true });
+  const t0 = Date.now();
+  const r = expectBridgeOk(await runBridge({ url: api.url, stateDir, cwd, env: { FREEBUFF_IDLE_SECS: "60" } }));
+  expect(Date.now() - t0).toBeLessThan(20_000);
+  expect(r.code).toBe(0);
+  expect(r.stdout).toContain("attention: failed");
+});
 test("M-563: task text mentioning prompt_policy_refused is not a refusal", async () => {
   const api = await fixtureServer({ echoUserText: true });
   const dir = mkdtempSync(join(scratchRoot, "freebuff-bridge-falsepos-"));

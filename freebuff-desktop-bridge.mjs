@@ -535,6 +535,17 @@ for (let i = 0; i < MAX_POLLS; i++) {
   pump(r.messages || []);
   const t = r.thread || {};
   const queued = Number(t.pendingWorkCount) || 0;
+  // Stuck thread: attention needed (slot busy, failure) with nothing running
+  // and no receipts coming. Bail out with the attention reason instead of
+  // spinning until the 30-minute backstop.
+  if (t.turnState !== "running" && queued > 0 && t.attentionReason &&
+      t.attentionReason !== "refused") {
+    finalText = `attention: ${t.attentionReason}` +
+      (t.missionStatus?.note ? ` — ${t.missionStatus.note}` : "");
+    streamedAnything = true;
+    emitText(finalText);
+    break;
+  }
   if (t.turnState === "running" || queued > 0) {
     idleMs = 0;
     await sleep(POLL_MS);
