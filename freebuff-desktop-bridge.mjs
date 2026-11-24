@@ -7,7 +7,7 @@
 // (e.g. a token file / FB_HOME dir) the bridge resolves itself. Credentials
 // never travel through Multica's DB.
 import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync, renameSync } from "node:fs";
-import { join, resolve, dirname } from "node:path";
+import { join, resolve, dirname, basename } from "node:path";
 
 const FB_URL = (process.env.FREEBUFF_DESKTOP_URL || process.env.FB_URL || "http://localhost:4320").replace(/\/+$/, "");
 const LAUNCH_ID = process.env.FREEBUFF_DESKTOP_LAUNCH_ID || "";
@@ -54,10 +54,35 @@ function parseArgs(argv) {
 }
 const ARGS = parseArgs(process.argv.slice(2));
 const STDIN_PROMPT = process.argv.includes("--input-format") || !process.stdin.isTTY;
-const THREAD_MAX_AGE_MS = 4 * 60 * 60 * 1000;
+const THREAD_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 // The one entry the bridge used to advertise; also what "no --model" means.
 const DEFAULT_MODEL_ID = "freebuff-desktop";
 const MODEL = ARGS.model && ARGS.model !== DEFAULT_MODEL_ID ? ARGS.model : "";
+// M-563: natural-start flow. Every starter states the honest context (Multica,
+// repo, issue) with {REPO} filled from the task directory; {M}/{SUBJECT} stay
+// unresolved because the prompt never names an issue id.
+const STARTERS = [
+"Hi — we're working on Multica, currently repo `{REPO}`. I'm here to work through an issue with you.",
+"Hello — continuing work on `{REPO}` for the Multica project. We've got a bug to dig into.",
+"Hi! We're on the Multica project. I'd like you to review the changes in `{REPO}`.",
+"Hello again — Multica project, repo `{REPO}`. We need tests you'll trust for the current change.",
+"Hi — we're building Multica and the CI on `{REPO}` is failing. Want to debug it together.",
+"Hello — verifying a deployment for the Multica project, repo `{REPO}`.",
+"Hi — Multica project. This one's a research question before we commit, repo `{REPO}`. Explore and report back, no code changes.",
+"Hello — repo `{REPO}` on the Multica project. This is a documentation task.",
+"Hi — continuing on `{REPO}` in the Multica project. This is cleanup work.",
+"Hello — Multica project, repo `{REPO}`. This is a config/template change.",
+];
+// M-563: seeded pick so runs vary the opener but stay reproducible per seed.
+// Seed from FREEBUFF_STARTER_SEED; default derives from the thread id so a
+// retry on the same thread repeats the same starter.
+function pickStarter(seedText) {
+  let h = 2166136261;
+  for (let i = 0; i < seedText.length; i++) { h ^= seedText.charCodeAt(i); h = Math.imul(h, 16777619); }
+  const idx = ((h >>> 0) % STARTERS.length + STARTERS.length) % STARTERS.length;
+  console.error(`starter=${idx}`);
+  return { idx, text: STARTERS[idx].replaceAll("{REPO}", basename(process.cwd())) };
+}
 
 // Every model the account at FB_URL can pick. The desktop publishes its picker
 // catalog as the first `state` event of GET /api/events (snapshot.freebuff.models),
@@ -269,6 +294,34 @@ if (!tid) {
   tid = r.id;
   createdThread = true;
 }
+// M-563: refusal is a hard stop, not a retry. The engine reports it inside
+// the thread state (lastTurnOutcome / outcome) or inside the transcript. One
+// sighting stops the session and fails the run; never resend or reword.
+const REFUSAL = "prompt_policy_refused";
+function isRefusalThread(t) {
+  return typeof t?.lastTurnOutcome === "string" && t.lastTurnOutcome.includes(REFUSAL);
+}
+function isRefusalSnapshot(r) {
+  if (isRefusalThread(r?.thread)) return true;
+  return JSON.stringify(r?.messages || []).includes(REFUSAL);
+}
+function hardStopRefusal(reason) {
+  console.error(`HARD STOP: ${REFUSAL} (${reason}). No resend, no reword, no retry. Reroute the card to another live runtime.`);
+  emit({ type: "result", result: REFUSAL, is_error: true, session_id: tid });
+  process.exit(3);
+}
+// M-563: mission queue. Enqueueing the real task as a Mission lets the desktop
+// auto-run turns to completion; the bridge then polls for idle, not one turn.
+const MISSION_EFFORT = Math.min(5, Math.max(1, Number(process.env.FREEBUFF_MISSION_EFFORT) || 3));
+async function enqueue(text, mission) {
+  const body = { text, ...(mission ? { mission: { prompt: text, effort: MISSION_EFFORT } } : {}) };
+  const r = await api(`/api/thread/${tid}/queue`, { method: "POST", body: JSON.stringify(body) });
+  checkRefusalSync(r, "queue-response");
+  return r;
+}
+function checkRefusalSync(obj, where) {
+  if (JSON.stringify(obj ?? "").includes(REFUSAL)) hardStopRefusal(where);
+}
 if (createdThread) {
   // The bridge owns thread creation/rotation, so it also owns creation-time
   // task context. This covers expired/invalid --resume IDs without duplicating
@@ -279,6 +332,16 @@ if (createdThread) {
       prompt = "Context for this task (from CODEBUDDY.md). Follow the task-scoped runtime instructions below.\n\n" + context + "\n\n---\n\n" + prompt;
     }
   } catch {}
+  // M-563 natural start: starter -> honest brief -> mission, in that order.
+  // The starter and brief open the thread; the real task rides as the Mission.
+  const seedText = process.env.FREEBUFF_STARTER_SEED || tid;
+  const starter = pickStarter(seedText);
+  await enqueue(starter.text, false);
+  const brief = "Context before I give the task: this is a Multica-driven session in this repo. Goal: the task I am about to queue. Read any earlier thread context sparingly — this thread was just created, so there is none.";
+  await enqueue(brief, false);
+  await enqueue(prompt, true);
+} else if (isRefusalThread(tinfo)) {
+  hardStopRefusal("adopted-thread");
 }
 const known = MODEL ? state.threads[MODEL] : state.thread_id;
 if (known !== tid) {
@@ -331,14 +394,22 @@ const partLen = (p) => (p && typeof p.text === "string" ? p.text.length : 0);
 // are not replayed into this run's transcript.
 let seenCount = 0;
 let seenParts = [];
-try {
-  const base = await api(`/api/thread/${tid}`);
-  const baseMsgs = base.messages || [];
-  seenCount = baseMsgs.filter((m) => m.role === "assistant").length;
-  seenParts = ((assistantOf(baseMsgs) || {}).parts || []).map((p) => ({ kind: p.kind, len: partLen(p) }));
-} catch {}
-
-await api(`/api/thread/${tid}/message`, { method: "POST", body: JSON.stringify({ text: prompt }) });
+// Refusal on a resumed thread: the pre-start adopt GET already saw it.
+let baseSnapshot = null;
+ try {
+  baseSnapshot = await api(`/api/thread/${tid}`);
+  if (isRefusalSnapshot(baseSnapshot)) hardStopRefusal("resumed-thread");
+  const baseMsgs = baseSnapshot.messages || [];
+   seenCount = baseMsgs.filter((m) => m.role === "assistant").length;
+   seenParts = ((assistantOf(baseMsgs) || {}).parts || []).map((p) => ({ kind: p.kind, len: partLen(p) }));
+ } catch {}
+if (!createdThread) {
+  checkRefusalSync(tinfo, "resumed-thread");
+  checkRefusalSync(baseSnapshot, "resumed-thread");
+ // Resume: the thread already had its natural start; the new task joins the
+ // queue directly as a plain prompt.
+   await enqueue(prompt, false);
+ }
 
 const emittedTools = new Set();
 const resultedTools = new Set();
@@ -402,8 +473,14 @@ function pump(msgs, final = false) {
   if (text) finalText = text;
 }
 
-// 30 minutes at the default cadence; the old fixed loop gave up at 20.
+// M-563: poll until the thread goes idle with no queued work, then end the
+// session. Idle minutes with nothing queued end the run; `running` (or newly
+// queued work) resets the clock. Refusal anywhere is a hard stop (exit 3).
+// FREEBUFF_IDLE_SECS overrides the 5-minute default. The 30-minute cap is a
+// backstop so a never-idle thread cannot hold the run slot forever.
+const IDLE_SECS = Math.max(1, Number(process.env.FREEBUFF_IDLE_SECS) || 300);
 const MAX_POLLS = Math.ceil(1_800_000 / POLL_MS);
+let idleMs = 0;
 for (let i = 0; i < MAX_POLLS; i++) {
   let r;
   try {
@@ -412,17 +489,46 @@ for (let i = 0; i < MAX_POLLS; i++) {
     await sleep(POLL_MS);
     continue;
   }
+  if (isRefusalSnapshot(r)) hardStopRefusal("poll");
   pump(r.messages || []);
-  if ((r.thread || {}).turnState !== "running") break;
+  const t = r.thread || {};
+  const queued = Number(t.pendingWorkCount) || 0;
+  if (t.turnState === "running" || queued > 0) {
+    idleMs = 0;
+    await sleep(POLL_MS);
+    continue;
+  }
+  idleMs += POLL_MS;
+  if (idleMs >= IDLE_SECS * 1000) break;
   await sleep(POLL_MS);
 }
 
 // Final read: the slice produced between the last poll and the turn going idle.
 try {
   const r = await api(`/api/thread/${tid}`);
+  if (isRefusalSnapshot(r)) hardStopRefusal("final-read");
   pump(r.messages || [], true);
 } catch {}
 
+// M-563: when the run queued a Mission, its receipt is the deliverable — the
+// chat text may only hold the starter/brief acknowledgements.
+if (createdThread) {
+  try {
+    const rec = await api(`/api/thread/${tid}/mission-receipts`);
+    const receipts = rec.receipts || [];
+    const last = receipts[receipts.length - 1];
+    if (last) {
+      const note = last.outcome?.note || last.status || "";
+      finalText = `Mission ${last.status || "finished"} (effort ${last.effort ?? MISSION_EFFORT}): ${note}`.trim();
+      streamedAnything = true;
+      emitText(finalText);
+      if (last.status && last.status !== "completed" && last.status !== "finished") {
+        emit({ type: "result", result: finalText, is_error: true, session_id: tid, num_turns: 1 });
+        process.exit(0);
+      }
+    }
+  } catch {}
+}
 // A turn with no visible parts still has to answer.
 if (!streamedAnything) emitText(finalText);
 emit({ type: "result", result: finalText, is_error: false, session_id: tid, num_turns: 1 });

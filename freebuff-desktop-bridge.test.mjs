@@ -15,10 +15,12 @@ afterEach(() => {
   for (const dir of scratchDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function fixtureServer({ launchIDs, onRequest = () => {} } = {}) {
+function fixtureServer({ launchIDs, onRequest = () => {}, refusal = null, threadFields = {}, pollScript = null } = {}) {
   const requests = [];
   const threads = new Map();
+  const queueBodies = [];
   let sequence = 0;
+  let getCount = 0;
   const server = createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -43,12 +45,28 @@ function fixtureServer({ launchIDs, onRequest = () => {} } = {}) {
       const id = decodeURIComponent(url.pathname.slice("/api/thread/".length));
       const thread = threads.get(id);
       if (!thread) return json({}, 404);
-      return json({ thread, messages: thread.messages || [] });
+      if (refusal && (refusal === "always" || (refusal === "poll" && ++getCount >= 1))) {
+        return json({ thread: { ...thread, lastTurnOutcome: "prompt_policy_refused: Driven by another agent" }, messages: [] });
+      }
+      if (pollScript) thread.turnState = pollScript(getCount++, thread);
+      return json({ thread: { pendingWorkCount: 0, ...threadFields, ...thread }, messages: thread.messages || [] });
+    }
+    if (req.method === "GET" && url.pathname.endsWith("/mission-receipts")) {
+      return json({ receipts: [] });
     }
     if (req.method === "POST" && url.pathname === "/api/threads") {
       const id = `new-${++sequence}`;
       threads.set(id, { id, status: "open", turnState: "idle", createdAt: new Date().toISOString(), messages: [] });
       return json({ id });
+    }
+    const queueMatch = url.pathname.match(/^\/api\/thread\/([^/]+)\/queue$/);
+    if (req.method === "POST" && queueMatch) {
+      const thread = threads.get(decodeURIComponent(queueMatch[1]));
+      const message = JSON.parse(body);
+      queueBodies.push(message);
+      thread.messages = [{ role: "assistant", parts: [{ kind: "text", text: "done" }] }];
+      thread.lastPrompt = message.text;
+      return json({ id: `item-${queueBodies.length}` });
     }
     const messageMatch = url.pathname.match(/^\/api\/thread\/([^/]+)\/message$/);
     if (req.method === "POST" && messageMatch) {
@@ -62,17 +80,17 @@ function fixtureServer({ launchIDs, onRequest = () => {} } = {}) {
   });
   servers.push(server);
   return new Promise((resolveListen) => server.listen(0, "127.0.0.1", () => {
-    resolveListen({ requests, threads, url: `http://127.0.0.1:${server.address().port}` });
+    resolveListen({ requests, threads, queueBodies, url: `http://127.0.0.1:${server.address().port}` });
   }));
 }
 
-function runBridge({ url, stateDir, cwd, resume, prompt = "do the task", launchID, listModels = false }) {
+function runBridge({ url, stateDir, cwd, resume, prompt = "do the task", launchID, listModels = false, env = {} }) {
   return new Promise((resolveRun, reject) => {
     const args = listModels ? [bridge, "--list-models", "--json"] : [bridge, "--output-format", "stream-json", "--input-format", "stream-json"];
     if (resume) args.push("--resume", resume);
     const child = spawn(process.execPath, args, {
       cwd,
-      env: { ...process.env, FREEBUFF_DESKTOP_URL: url, FREEBUFF_DESKTOP_STATE_DIR: stateDir, FREEBUFF_DESKTOP_POLL_MS: "150", ...(launchID ? { FREEBUFF_DESKTOP_LAUNCH_ID: launchID } : {}) },
+      env: { ...process.env, FREEBUFF_DESKTOP_URL: url, FREEBUFF_DESKTOP_STATE_DIR: stateDir, FREEBUFF_DESKTOP_POLL_MS: "150", FREEBUFF_IDLE_SECS: "1", ...(launchID ? { FREEBUFF_DESKTOP_LAUNCH_ID: launchID } : {}), ...env },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -80,9 +98,14 @@ function runBridge({ url, stateDir, cwd, resume, prompt = "do the task", launchI
     child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
     child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
     child.on("error", reject);
-    child.on("close", (code) => code === 0 ? resolveRun({ stdout, stderr }) : reject(new Error(`bridge exited ${code}: ${stderr}`)));
+    child.on("close", (code) => resolveRun({ stdout, stderr, code }));
     if (!listModels) child.stdin.end(JSON.stringify({ type: "user", message: { content: prompt } }) + "\n");
   });
+}
+
+function expectBridgeOk(r) {
+  if (r.code !== 0) throw new Error(`bridge exited ${r.code}: ${r.stderr}`);
+  return r;
 }
 
 test("expired resume rotates to a fresh thread with task context; valid resume keeps task identity without reinjecting context", async () => {
@@ -103,21 +126,31 @@ test("expired resume rotates to a fresh thread with task context; valid resume k
   } });
   api.threads.set("expired", {
     id: "expired", status: "open", turnState: "idle",
-    createdAt: new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString(), messages: [],
+    createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(), messages: [],
   });
 
-  const rotated = await runBridge({ url: api.url, stateDir, cwd, resume: "expired" });
+  const rotated = expectBridgeOk(await runBridge({ url: api.url, stateDir, cwd, resume: "expired", env: { FREEBUFF_STARTER_SEED: "s1", FREEBUFF_IDLE_SECS: "1" } }));
+  expect(api.queueBodies.length).toBe(3);
+  expect(api.queueBodies[0].mission).toBeUndefined();
+  expect(api.queueBodies[0].text).toContain("Multica");
+  expect(api.queueBodies[1].mission).toBeUndefined();
+  expect(api.queueBodies[1].text).toContain("Context before I give the task");
+  expect(api.queueBodies[2].mission).toEqual({ prompt: api.queueBodies[2].text, effort: 3 });
   const firstPrompt = api.threads.get("new-1").lastPrompt;
   expect(firstPrompt).toContain("task-specific context");
   expect(firstPrompt).toContain("pre-authenticated as this agent for this task");
   expect(rotated.stdout).toContain('"session_id":"new-1"');
   expect(api.requests.some((request) => request.path === "/api/projects")).toBe(false);
+  expect(api.requests.some((request) => request.path === "/api/thread/new-1/message")).toBe(false);
 
   api.threads.set("recent", {
     id: "recent", status: "open", turnState: "idle",
-    createdAt: new Date(Date.now() - 4 * 60 * 60 * 1000 + 60_000).toISOString(), messages: [],
+    createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000 + 60_000).toISOString(), messages: [],
   });
-  const resumed = await runBridge({ url: api.url, stateDir, cwd, resume: "recent", prompt: "follow-up" });
+  const queueBefore = api.queueBodies.length;
+  const resumed = expectBridgeOk(await runBridge({ url: api.url, stateDir, cwd, resume: "recent", prompt: "follow-up", env: { FREEBUFF_IDLE_SECS: "1" } }));
+  expect(api.queueBodies.length).toBe(queueBefore + 1);
+  expect(api.queueBodies[api.queueBodies.length - 1].mission).toBeUndefined();
   const secondPrompt = api.threads.get("recent").lastPrompt;
   expect(secondPrompt).not.toContain("task-specific context");
   expect(secondPrompt).toContain("pre-authenticated as this agent for this task");
@@ -139,13 +172,14 @@ test("launch ID authenticates model discovery and task APIs, and a restarted bri
   expect(JSON.parse(catalog.stdout).models).toEqual([{ id: "model-a", name: "Model A", provider: "freebuff" }]);
   expect(api.requests.filter((request) => request.path === "/api/auth/status" || request.path === "/api/events").every((request) => request.launchID === "launch-one")).toBe(true);
 
-  await runBridge({ url: api.url, stateDir, cwd, launchID: "launch-one" });
+  expectBridgeOk(await runBridge({ url: api.url, stateDir, cwd, launchID: "launch-one", env: { FREEBUFF_IDLE_SECS: "1" } }));
   const beforeRestart = api.requests.length;
-  await runBridge({ url: api.url, stateDir, cwd, launchID: "launch-two", prompt: "after restart" });
+  expectBridgeOk(await runBridge({ url: api.url, stateDir, cwd, launchID: "launch-two", prompt: "after restart", env: { FREEBUFF_IDLE_SECS: "1" } }));
   const restartedRequests = api.requests.slice(beforeRestart);
   expect(restartedRequests.length).toBeGreaterThan(0);
   expect(restartedRequests.every((request) => request.launchID === "launch-two")).toBe(true);
-  expect(restartedRequests.some((request) => request.path === "/api/thread/new-1/message")).toBe(true);
+  expect(restartedRequests.some((request) => request.path === "/api/thread/new-1/queue")).toBe(true);
+  expect(restartedRequests.some((request) => request.path === "/api/thread/new-1/message")).toBe(false);
   expect(readFileSync(join(stateDir, "bridge-state.json"), "utf8")).not.toContain("launch-two");
 });
 
@@ -166,4 +200,80 @@ test("account bridge caches stay isolated", async () => {
   const stateB = JSON.parse(readFileSync(join(accountB, "bridge-state.json"), "utf8"));
   expect(stateA.thread_id).toBe("new-1");
   expect(stateB.thread_id).toBe("new-2");
+});
+
+test("M-563: seeded starter pick is stable per seed and logged", async () => {
+  const api = await fixtureServer();
+  const mk = (name) => {
+    const dir = mkdtempSync(join(scratchRoot, name));
+    scratchDirs.push(dir);
+    const stateDir = join(dir, "account-state");
+    const cwd = join(dir, "task");
+    mkdirSync(stateDir, { recursive: true });
+    mkdirSync(cwd, { recursive: true });
+    return { stateDir, cwd };
+  };
+  const a = mk("freebuff-bridge-seed-a-");
+  const b = mk("freebuff-bridge-seed-b-");
+  const ra = expectBridgeOk(await runBridge({ url: api.url, ...a, env: { FREEBUFF_STARTER_SEED: "same-seed", FREEBUFF_IDLE_SECS: "1" } }));
+  const rb = expectBridgeOk(await runBridge({ url: api.url, ...b, env: { FREEBUFF_STARTER_SEED: "same-seed", FREEBUFF_IDLE_SECS: "1" } }));
+  const idxA = ra.stderr.match(/starter=(\d+)/)?.[1];
+  const idxB = rb.stderr.match(/starter=(\d+)/)?.[1];
+  expect(idxA).toBeDefined();
+  expect(idxA).toBe(idxB);
+  expect(api.queueBodies[0].text).toBe(api.queueBodies[3].text);
+  const rc = mk("freebuff-bridge-seed-c-");
+  const r2 = expectBridgeOk(await runBridge({ url: api.url, ...rc, env: { FREEBUFF_STARTER_SEED: "other-seed", FREEBUFF_IDLE_SECS: "1" } }));
+  const idxC = r2.stderr.match(/starter=(\d+)/)?.[1];
+  expect(idxC).toBeDefined();
+});
+
+test("M-563: thread reuse cutoff is 2h — a 3h-old thread rotates", async () => {
+  const api = await fixtureServer();
+  const dir = mkdtempSync(join(scratchRoot, "freebuff-bridge-cutoff-"));
+  scratchDirs.push(dir);
+  const stateDir = join(dir, "account-state");
+  const cwd = join(dir, "task");
+  mkdirSync(stateDir, { recursive: true });
+  mkdirSync(cwd, { recursive: true });
+  writeFileSync(join(stateDir, "bridge-state.json"), JSON.stringify({ thread_id: "old" }));
+  api.threads.set("old", {
+    id: "old", status: "open", turnState: "idle",
+    createdAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), messages: [],
+  });
+  const r = expectBridgeOk(await runBridge({ url: api.url, stateDir, cwd, resume: "old", env: { FREEBUFF_IDLE_SECS: "1" } }));
+  expect(r.stdout).toContain('"session_id":"new-1"');
+  expect(api.queueBodies.length).toBe(3);
+});
+
+test("M-563: idle end waits out running and stops after the threshold", async () => {
+  const api = await fixtureServer({ pollScript: (n) => (n === 0 ? "running" : "idle"), threadFields: { pendingWorkCount: 0 } });
+  const dir = mkdtempSync(join(scratchRoot, "freebuff-bridge-idle-"));
+  scratchDirs.push(dir);
+  const stateDir = join(dir, "account-state");
+  const cwd = join(dir, "task");
+  mkdirSync(stateDir, { recursive: true });
+  mkdirSync(cwd, { recursive: true });
+  const t0 = Date.now();
+  expectBridgeOk(await runBridge({ url: api.url, stateDir, cwd, env: { FREEBUFF_IDLE_SECS: "1", FREEBUFF_DESKTOP_POLL_MS: "150" } }));
+  const elapsed = Date.now() - t0;
+  expect(elapsed).toBeGreaterThanOrEqual(900);
+  expect(elapsed).toBeLessThan(30_000);
+});
+
+test("M-563: refusal hard-stops with exit 3 and never posts the task", async () => {
+  const api = await fixtureServer({ refusal: "poll" });
+  const dir = mkdtempSync(join(scratchRoot, "freebuff-bridge-refusal-"));
+  scratchDirs.push(dir);
+  const stateDir = join(dir, "account-state");
+  const cwd = join(dir, "task");
+  mkdirSync(stateDir, { recursive: true });
+  mkdirSync(cwd, { recursive: true });
+  api.threads.set("refused", { id: "refused", status: "open", turnState: "idle", createdAt: new Date().toISOString(), messages: [] });
+  const r = await runBridge({ url: api.url, stateDir, cwd, resume: "refused", env: { FREEBUFF_IDLE_SECS: "60" } });
+  expect(r.code).toBe(3);
+  expect(r.stdout).toContain("prompt_policy_refused");
+  expect(r.stderr).toContain("HARD STOP");
+  expect(api.queueBodies.length).toBe(0);
+  expect(api.requests.filter((q) => q.method === "POST" && q.path.endsWith("/message")).length).toBe(0);
 });
