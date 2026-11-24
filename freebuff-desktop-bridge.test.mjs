@@ -15,7 +15,7 @@ afterEach(() => {
   for (const dir of scratchDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function fixtureServer({ launchIDs, onRequest = () => {}, refusal = null, threadFields = {}, pollScript = null } = {}) {
+function fixtureServer({ launchIDs, onRequest = () => {}, refusal = null, threadFields = {}, pollScript = null, echoUserText = false } = {}) {
   const requests = [];
   const threads = new Map();
   const queueBodies = [];
@@ -59,12 +59,21 @@ function fixtureServer({ launchIDs, onRequest = () => {}, refusal = null, thread
       threads.set(id, { id, status: "open", turnState: "idle", createdAt: new Date().toISOString(), messages: [] });
       return json({ id });
     }
+    const actionMatch = url.pathname.match(/^\/api\/thread\/([^/]+)\/(stop|queue\/pause)$/);
+    if (req.method === "POST" && actionMatch) {
+      const thread = threads.get(decodeURIComponent(actionMatch[1]));
+      if (thread) thread[actionMatch[2] === "stop" ? "stopped" : "paused"] = true;
+      return json({ ok: true });
+    }
     const queueMatch = url.pathname.match(/^\/api\/thread\/([^/]+)\/queue$/);
     if (req.method === "POST" && queueMatch) {
       const thread = threads.get(decodeURIComponent(queueMatch[1]));
       const message = JSON.parse(body);
       queueBodies.push(message);
-      thread.messages = [{ role: "assistant", parts: [{ kind: "text", text: "done" }] }];
+      thread.messages = echoUserText
+        ? [{ role: "user", parts: [{ kind: "text", text: message.text }] },
+           { role: "assistant", parts: [{ kind: "text", text: "done" }] }]
+        : [{ role: "assistant", parts: [{ kind: "text", text: "done" }] }];
       thread.lastPrompt = message.text;
       return json({ id: `item-${queueBodies.length}` });
     }
@@ -276,4 +285,58 @@ test("M-563: refusal hard-stops with exit 3 and never posts the task", async () 
   expect(r.stderr).toContain("HARD STOP");
   expect(api.queueBodies.length).toBe(0);
   expect(api.requests.filter((q) => q.method === "POST" && q.path.endsWith("/message")).length).toBe(0);
+  const thread = api.threads.get("refused");
+  expect(thread.stopped).toBe(true);
+  expect(thread.paused).toBe(true);
+});
+
+test("M-563: task text mentioning prompt_policy_refused is not a refusal", async () => {
+  const api = await fixtureServer({ echoUserText: true });
+  const dir = mkdtempSync(join(scratchRoot, "freebuff-bridge-falsepos-"));
+  scratchDirs.push(dir);
+  const stateDir = join(dir, "account-state");
+  const cwd = join(dir, "task");
+  mkdirSync(stateDir, { recursive: true });
+  mkdirSync(cwd, { recursive: true });
+  const r = expectBridgeOk(await runBridge({
+    url: api.url, stateDir, cwd, prompt: "handle prompt_policy_refused gracefully per the policy doc",
+    env: { FREEBUFF_IDLE_SECS: "1" },
+  }));
+  expect(r.code).toBe(0);
+  expect(r.stdout).not.toContain("prompt_policy_refused");
+  expect(r.stderr).not.toContain("HARD STOP");
+  expect(api.queueBodies.length).toBe(3);
+  expect(api.queueBodies[2].text).toContain("prompt_policy_refused");
+});
+
+test("M-563: idle end stops the session (stop + queue/pause)", async () => {
+  const api = await fixtureServer({ pollScript: () => "idle", threadFields: { pendingWorkCount: 0 } });
+  const dir = mkdtempSync(join(scratchRoot, "freebuff-bridge-idlestop-"));
+  scratchDirs.push(dir);
+  const stateDir = join(dir, "account-state");
+  const cwd = join(dir, "task");
+  mkdirSync(stateDir, { recursive: true });
+  mkdirSync(cwd, { recursive: true });
+  expectBridgeOk(await runBridge({ url: api.url, stateDir, cwd, env: { FREEBUFF_IDLE_SECS: "1" } }));
+  const thread = api.threads.get("new-1");
+  expect(thread.stopped).toBe(true);
+  expect(thread.paused).toBe(true);
+});
+
+test("M-563: starter names real repo via FREEBUFF_REPO and issue via FREEBUFF_ISSUE", async () => {
+  const api = await fixtureServer();
+  const dir = mkdtempSync(join(scratchRoot, "freebuff-bridge-repo-"));
+  scratchDirs.push(dir);
+  const stateDir = join(dir, "account-state");
+  const cwd = join(dir, "task");
+  mkdirSync(stateDir, { recursive: true });
+  mkdirSync(cwd, { recursive: true });
+  expectBridgeOk(await runBridge({
+    url: api.url, stateDir, cwd,
+    env: { FREEBUFF_IDLE_SECS: "1", FREEBUFF_REPO: "multica-x", FREEBUFF_ISSUE: "M-563", FREEBUFF_STARTER_SEED: "repo-seed" },
+  }));
+  expect(api.queueBodies[0].text).toContain("`multica-x`");
+  expect(api.queueBodies[0].text).toContain("M-563");
+  expect(api.queueBodies[0].text).not.toContain("{REPO}");
+  expect(api.queueBodies[0].text).not.toContain("{ISSUE}");
 });

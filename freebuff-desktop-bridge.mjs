@@ -59,19 +59,26 @@ const THREAD_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_MODEL_ID = "freebuff-desktop";
 const MODEL = ARGS.model && ARGS.model !== DEFAULT_MODEL_ID ? ARGS.model : "";
 // M-563: natural-start flow. Every starter states the honest context (Multica,
-// repo, issue) with {REPO} filled from the task directory; {M}/{SUBJECT} stay
-// unresolved because the prompt never names an issue id.
+// repo, issue). {REPO} comes from the task env (FREEBUFF_REPO, else the task
+// directory name); {ISSUE} from FREEBUFF_ISSUE (e.g. M-563). Placeholders stay
+// literal when unknown — the opener never invents a repo or issue. basename()
+// alone is wrong without the env: under Multica the cwd is `workdir`.
+function taskRepo() {
+  const fromEnv = (process.env.FREEBUFF_REPO || "").trim();
+  if (fromEnv) return fromEnv;
+  return basename(process.cwd());
+}
 const STARTERS = [
-"Hi — we're working on Multica, currently repo `{REPO}`. I'm here to work through an issue with you.",
-"Hello — continuing work on `{REPO}` for the Multica project. We've got a bug to dig into.",
-"Hi! We're on the Multica project. I'd like you to review the changes in `{REPO}`.",
-"Hello again — Multica project, repo `{REPO}`. We need tests you'll trust for the current change.",
-"Hi — we're building Multica and the CI on `{REPO}` is failing. Want to debug it together.",
-"Hello — verifying a deployment for the Multica project, repo `{REPO}`.",
-"Hi — Multica project. This one's a research question before we commit, repo `{REPO}`. Explore and report back, no code changes.",
-"Hello — repo `{REPO}` on the Multica project. This is a documentation task.",
-"Hi — continuing on `{REPO}` in the Multica project. This is cleanup work.",
-"Hello — Multica project, repo `{REPO}`. This is a config/template change.",
+"Hi — we're working on Multica, currently repo `{REPO}`. I'm here to work through issue {ISSUE} with you.",
+"Hello — continuing work on `{REPO}` for the Multica project. We've got issue {ISSUE} to dig into.",
+"Hi! We're on the Multica project. I'd like you to review the changes tied to issue {ISSUE} in `{REPO}`.",
+"Hello again — Multica project, repo `{REPO}`. Issue {ISSUE} needs tests you'll trust.",
+"Hi — we're building Multica and the CI on `{REPO}` for issue {ISSUE} is failing. Want to debug it together.",
+"Hello — verifying a deployment for the Multica project, repo `{REPO}`, issue {ISSUE}.",
+"Hi — Multica project. This one's a research question before we commit, repo `{REPO}`, issue {ISSUE}. Explore and report back, no code changes.",
+"Hello — repo `{REPO}` on the Multica project. Issue {ISSUE} is a documentation task.",
+"Hi — continuing on `{REPO}` in the Multica project. Issue {ISSUE} is cleanup work.",
+"Hello — Multica project, repo `{REPO}`. Issue {ISSUE} is a config/template change.",
 ];
 // M-563: seeded pick so runs vary the opener but stay reproducible per seed.
 // Seed from FREEBUFF_STARTER_SEED; default derives from the thread id so a
@@ -80,8 +87,10 @@ function pickStarter(seedText) {
   let h = 2166136261;
   for (let i = 0; i < seedText.length; i++) { h ^= seedText.charCodeAt(i); h = Math.imul(h, 16777619); }
   const idx = ((h >>> 0) % STARTERS.length + STARTERS.length) % STARTERS.length;
-  console.error(`starter=${idx}`);
-  return { idx, text: STARTERS[idx].replaceAll("{REPO}", basename(process.cwd())) };
+  const issue = (process.env.FREEBUFF_ISSUE || "").trim() || "{ISSUE}";
+  console.error(`starter=${idx} repo=${taskRepo()} issue=${issue}`);
+  const text = STARTERS[idx].replaceAll("{REPO}", taskRepo()).replaceAll("{ISSUE}", issue);
+  return { idx, text };
 }
 
 // Every model the account at FB_URL can pick. The desktop publishes its picker
@@ -294,18 +303,48 @@ if (!tid) {
   tid = r.id;
   createdThread = true;
 }
-// M-563: refusal is a hard stop, not a retry. The engine reports it inside
-// the thread state (lastTurnOutcome / outcome) or inside the transcript. One
+// M-563: refusal is a hard stop, not a retry. The engine reports it in its
+// own fields — thread.lastTurnOutcome, attention/receipt outcome codes, or
+// assistant/system error parts. User-role content is NEVER scanned: the
+// queued task text itself is echoed in messages, so scanning it would flag
+// the bridge's own prompt (e.g. a task that discusses refusals). One
 // sighting stops the session and fails the run; never resend or reword.
 const REFUSAL = "prompt_policy_refused";
+function textOf(v) { return typeof v === "string" ? v : v == null ? "" : JSON.stringify(v); }
 function isRefusalThread(t) {
-  return typeof t?.lastTurnOutcome === "string" && t.lastTurnOutcome.includes(REFUSAL);
+  return textOf(t?.lastTurnOutcome).includes(REFUSAL) ||
+    textOf(t?.attentionReason).includes(REFUSAL) ||
+    textOf(t?.missionStatus?.outcome).includes(REFUSAL) ||
+    textOf(t?.missionStatus?.note).includes(REFUSAL);
+}
+function refusalInParts(parts) {
+  return (parts || []).some((p) => {
+    if (!p || typeof p !== "object") return false;
+    if (p.kind === "text" || p.kind === "reasoning") return false;
+    return textOf(p.text).includes(REFUSAL) || textOf(p.error).includes(REFUSAL) ||
+      textOf(p.errorMessage).includes(REFUSAL) || textOf(p.message).includes(REFUSAL);
+  });
 }
 function isRefusalSnapshot(r) {
   if (isRefusalThread(r?.thread)) return true;
-  return JSON.stringify(r?.messages || []).includes(REFUSAL);
+  for (const m of r?.messages || []) {
+    if (m?.role === "user") continue;
+    if (refusalInParts(m?.parts)) return true;
+  }
+  for (const it of r?.items || []) {
+    if (textOf(it?.outcome).includes(REFUSAL) || textOf(it?.error).includes(REFUSAL)) return true;
+  }
+  return false;
 }
-function hardStopRefusal(reason) {
+async function stopSession(reason) {
+  // Best effort: stop the running turn, pause the queue so a queued Mission
+  // cannot keep running in the desktop after the bridge exits.
+  try { await api(`/api/thread/${tid}/stop`, { method: "POST", body: "{}" }); } catch {}
+  try { await api(`/api/thread/${tid}/queue/pause`, { method: "POST", body: "{}" }); } catch {}
+  console.error(`session-stop: ${reason} (thread ${tid})`);
+}
+async function hardStopRefusal(reason) {
+  await stopSession(`refusal:${reason}`);
   console.error(`HARD STOP: ${REFUSAL} (${reason}). No resend, no reword, no retry. Reroute the card to another live runtime.`);
   emit({ type: "result", result: REFUSAL, is_error: true, session_id: tid });
   process.exit(3);
@@ -316,11 +355,14 @@ const MISSION_EFFORT = Math.min(5, Math.max(1, Number(process.env.FREEBUFF_MISSI
 async function enqueue(text, mission) {
   const body = { text, ...(mission ? { mission: { prompt: text, effort: MISSION_EFFORT } } : {}) };
   const r = await api(`/api/thread/${tid}/queue`, { method: "POST", body: JSON.stringify(body) });
-  checkRefusalSync(r, "queue-response");
+  if (textOf(r?.error).includes(REFUSAL)) await hardStopRefusal("queue-response");
   return r;
 }
-function checkRefusalSync(obj, where) {
-  if (JSON.stringify(obj ?? "").includes(REFUSAL)) hardStopRefusal(where);
+async function checkRefusalSync(obj, where) {
+  // Sync contexts (resumed-thread baseline): engine fields only. The queued
+  // task text is user-role content — never scanned.
+  if (isRefusalThread(obj)) await hardStopRefusal(where);
+  else if (obj && typeof obj === "object" && "messages" in obj && isRefusalSnapshot(obj)) await hardStopRefusal(where);
 }
 if (createdThread) {
   // The bridge owns thread creation/rotation, so it also owns creation-time
@@ -341,7 +383,7 @@ if (createdThread) {
   await enqueue(brief, false);
   await enqueue(prompt, true);
 } else if (isRefusalThread(tinfo)) {
-  hardStopRefusal("adopted-thread");
+  await hardStopRefusal("adopted-thread");
 }
 const known = MODEL ? state.threads[MODEL] : state.thread_id;
 if (known !== tid) {
@@ -398,14 +440,14 @@ let seenParts = [];
 let baseSnapshot = null;
  try {
   baseSnapshot = await api(`/api/thread/${tid}`);
-  if (isRefusalSnapshot(baseSnapshot)) hardStopRefusal("resumed-thread");
+  if (isRefusalSnapshot(baseSnapshot)) await hardStopRefusal("resumed-thread");
   const baseMsgs = baseSnapshot.messages || [];
    seenCount = baseMsgs.filter((m) => m.role === "assistant").length;
    seenParts = ((assistantOf(baseMsgs) || {}).parts || []).map((p) => ({ kind: p.kind, len: partLen(p) }));
  } catch {}
-if (!createdThread) {
-  checkRefusalSync(tinfo, "resumed-thread");
-  checkRefusalSync(baseSnapshot, "resumed-thread");
+ if (!createdThread) {
+  await checkRefusalSync(tinfo, "resumed-thread");
+  await checkRefusalSync(baseSnapshot, "resumed-thread");
  // Resume: the thread already had its natural start; the new task joins the
  // queue directly as a plain prompt.
    await enqueue(prompt, false);
@@ -489,7 +531,7 @@ for (let i = 0; i < MAX_POLLS; i++) {
     await sleep(POLL_MS);
     continue;
   }
-  if (isRefusalSnapshot(r)) hardStopRefusal("poll");
+  if (isRefusalSnapshot(r)) await hardStopRefusal("poll");
   pump(r.messages || []);
   const t = r.thread || {};
   const queued = Number(t.pendingWorkCount) || 0;
@@ -499,14 +541,17 @@ for (let i = 0; i < MAX_POLLS; i++) {
     continue;
   }
   idleMs += POLL_MS;
-  if (idleMs >= IDLE_SECS * 1000) break;
+  if (idleMs >= IDLE_SECS * 1000) {
+    await stopSession(`idle-end:${Math.round(idleMs / 1000)}s`);
+    break;
+  }
   await sleep(POLL_MS);
 }
 
 // Final read: the slice produced between the last poll and the turn going idle.
 try {
   const r = await api(`/api/thread/${tid}`);
-  if (isRefusalSnapshot(r)) hardStopRefusal("final-read");
+  if (isRefusalSnapshot(r)) await hardStopRefusal("final-read");
   pump(r.messages || [], true);
 } catch {}
 
